@@ -1,0 +1,11 @@
+bin/
+obj/
+**/bin/
+**/obj/
+/.vs
+.idea
+*.user
+*.suo
+*.userprefs
+*.cache
+Artifacts
