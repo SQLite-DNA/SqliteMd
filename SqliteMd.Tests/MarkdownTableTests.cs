@@ -72,5 +72,5 @@ public class MarkdownTableTests
     }
 
     public static IEnumerable<object[]> ConnectionData =>
-        SqliteConnection.GenerateConnectionParameters(new string[] { "SqliteMd" }, SqliteProvider.System);
+        SqliteConnection.GenerateConnectionParameters(new string[] { "SqliteMd" }, SqliteProvider.SQLiteCpp);
 }
