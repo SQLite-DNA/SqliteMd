@@ -150,6 +150,73 @@ public class MarkdownTableTests
         }
     }
 
+    [Theory, MemberData(nameof(ConnectionData))]
+    public void InsertMarkdownRow(string extensionFile, SqliteProvider provider)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), "SqliteMd", "Writes", Path.GetRandomFileName());
+        var targetPath = tempPath + ".md";
+        Directory.CreateDirectory(Path.GetDirectoryName(tempPath)!);
+        try
+        {
+            using var connection = SqliteConnection.Create("Data Source=:memory:", extensionFile, provider);
+            var escapedPath = SqliteLiteral(tempPath);
+            var escapedTarget = SqliteLiteral(targetPath);
+
+            Assert.Equal(1, ExecuteScalarLong(connection, $"SELECT insert_markdown_row('{escapedPath}', 'Notes', 'id,title,stars', '[1, \"Release notes\", 4]' ) AS rows_written"));
+            Assert.Equal(1, ExecuteScalarLong(connection, $"SELECT insert_markdown_row('{escapedPath}', 'Notes', 'id,title,stars', '[2, \"Testing coverage\", 7]' ) AS rows_written"));
+            Assert.True(File.Exists(targetPath));
+
+            Assert.Equal(0, connection.ExecuteNonQuery($"CREATE VIRTUAL TABLE inserted USING markdown('{escapedTarget}', '', 0)"));
+            using var reader = connection.ExecuteReader("SELECT source_row, id, title, stars FROM inserted ORDER BY source_row");
+            Assert.True(reader.Read());
+            Assert.Equal(1L, reader.GetItem<long>("source_row"));
+            Assert.Equal(1L, reader.GetItem<long>("id"));
+            Assert.Equal("Release notes", reader.GetItem<string>("title"));
+            Assert.True(reader.Read());
+            Assert.Equal(2L, reader.GetItem<long>("source_row"));
+            Assert.Equal(2L, reader.GetItem<long>("id"));
+            Assert.Equal("Testing coverage", reader.GetItem<string>("title"));
+        }
+        finally
+        {
+            File.Delete(targetPath);
+            Directory.Delete(Path.GetDirectoryName(tempPath)!, true);
+        }
+    }
+
+    [Theory, MemberData(nameof(ConnectionData))]
+    public void RewriteMarkdownRow(string extensionFile, SqliteProvider provider)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), "SqliteMd", "Writes", Path.GetRandomFileName());
+        var targetPath = tempPath + ".md";
+        Directory.CreateDirectory(Path.GetDirectoryName(tempPath)!);
+        try
+        {
+            using var connection = SqliteConnection.Create("Data Source=:memory:", extensionFile, provider);
+            var escapedPath = SqliteLiteral(targetPath);
+
+            Assert.Equal(2, ExecuteScalarLong(connection, $"SELECT write_markdown('{escapedPath}', 'Notes', 'id,title,stars', '[[1, \"Release notes\", 4], [2, \"Testing coverage\", 7]]' ) AS rows_written"));
+            Assert.Equal(1, ExecuteScalarLong(connection, $"SELECT rewrite_markdown_row('{escapedPath}', 'Notes', 'id,title,stars', 2, '[99, \"Updated\", 99]' ) AS rows_written"));
+
+            Assert.Equal(0, connection.ExecuteNonQuery($"CREATE VIRTUAL TABLE rewritten USING markdown('{escapedPath}', '', 0)"));
+            using var reader = connection.ExecuteReader("SELECT source_row, id, title, stars FROM rewritten ORDER BY source_row");
+            Assert.True(reader.Read());
+            Assert.Equal(1L, reader.GetItem<long>("source_row"));
+            Assert.Equal(1L, reader.GetItem<long>("id"));
+            Assert.True(reader.Read());
+            Assert.Equal(2L, reader.GetItem<long>("source_row"));
+            Assert.Equal(99L, reader.GetItem<long>("id"));
+            Assert.Equal("Updated", reader.GetItem<string>("title"));
+            Assert.Equal(99L, reader.GetItem<long>("stars"));
+            Assert.False(reader.Read());
+        }
+        finally
+        {
+            File.Delete(targetPath);
+            Directory.Delete(Path.GetDirectoryName(tempPath)!, true);
+        }
+    }
+
     private static string SqliteLiteral(string value)
     {
         return value.Replace("'", "''");

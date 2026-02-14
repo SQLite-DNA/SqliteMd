@@ -1,6 +1,18 @@
 # SQLiteMd Release Notes
 
-## v0.1.10 (unreleased)
+## v0.1.11 (unreleased)
+
+### Added
+- Added row-oriented write APIs:
+  - `insert_markdown_row(path, table_title, columns_csv, row_json)` for appending a single row.
+  - `rewrite_markdown_row(path, table_title, columns_csv, row_index, row_json)` for replacing a row in a markdown table.
+- Added tests covering row inserts and row rewrites.
+
+### Changed
+- Added helper API section in README for function-based write intent and updated examples.
+- Refined `.github/workflows/release.yml` to package a stable Windows x64 zip artifact and release it directly from tags, with manual dispatch support.
+
+## v0.1.10
 
 ### Added
 - Added `write_markdown(...)` SQL function for creating and updating Markdown documents from SQLite.

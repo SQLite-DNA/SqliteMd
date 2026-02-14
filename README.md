@@ -78,16 +78,34 @@ SELECT write_markdown(path, table_title, columns_csv, rows_json, overwrite);
 
 Returns the number of rows written.
 
+```sql
+SELECT insert_markdown_row(path, table_title, columns_csv, row_json);
+```
+
+Inserts a single row (`row_json`) into the matching markdown table. If no matching table is found, a new table is appended (or created).
+
+- `row_json`
+  - One JSON array representing a row.
+
+```sql
+SELECT rewrite_markdown_row(path, table_title, columns_csv, row_index, row_json);
+```
+
+Rewrites a row in place by `row_index` (`1` based) in the matching markdown table.
+- `row_index`: Data row index (1-based) within the selected table.
+- Returns `1` when exactly one row is rewritten.
+
 ### SQL `INSERT` / `UPDATE` support
 
 `markdown(...)` is intentionally a read-only virtual table.
 Native SQL `INSERT` and `UPDATE` against that table are not supported.
 
-Reason:
+Why:
 
-- The current extension uses `SqliteDna.Integration` table functions (`SqliteTableFunction` + `DynamicTable`).
-- `DynamicTable` materializes result rows and is read-only.
-- Markdown is a text document format, so writes are explicit and file-oriented via `write_markdown(...)`.
+- SQLite virtual tables can support writes only when the extension implements the virtual-table write interface (`xUpdate`).
+- `SqliteDna.Integration` table-function path used here (`SqliteTableFunction` + `DynamicTable`) emits a materialized read-only result set and does not expose `xUpdate`.
+- `INSERT`/`UPDATE` therefore fail at engine level for this virtual table implementation, independent of the underlying Markdown file format.
+- The extension intentionally keeps writes explicit with file-oriented helpers (`write_markdown`, `insert_markdown_row`, `rewrite_markdown_row`) to avoid ambiguous in-place SQL mutation semantics.
 
 Use `write_markdown(...)` as the write API:
 - default `overwrite = 0` appends a new table block,
@@ -113,6 +131,10 @@ SELECT write_markdown('output', 'Sprint Notes', 'id,title,stars', '[[1,"Plan",12
 
 -- create/overwrite a specific file
 SELECT write_markdown('output/sprint.md', 'Sprint Notes', 'id,title,stars', '[[1,"Plan",12],[2,"Ship",24]]', 1);
+
+-- row-oriented helpers
+SELECT insert_markdown_row('output/sprint.md', 'Sprint Notes', 'id,title,stars', '[3,"Review",19]');
+SELECT rewrite_markdown_row('output/sprint.md', 'Sprint Notes', 'id,title,stars', 2, '[2,"Ship",28]');
 ```
 
 ## Development

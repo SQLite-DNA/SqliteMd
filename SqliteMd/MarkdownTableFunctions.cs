@@ -177,6 +177,104 @@ public static class MarkdownTableFunctions
     }
 
     [SqliteFunction]
+    public static long insert_markdown_row(string destinationPath, string tableTitle, string columnsCsv, string rowJson)
+    {
+        return InsertMarkdownRow(destinationPath, tableTitle, columnsCsv, rowJson);
+    }
+
+    [SqliteFunction]
+    public static long rewrite_markdown_row(string destinationPath, string tableTitle, string columnsCsv, long rowIndex, string rowJson)
+    {
+        return RewriteMarkdownRow(destinationPath, tableTitle, columnsCsv, rowIndex, rowJson);
+    }
+
+    private static long InsertMarkdownRow(string destinationPath, string tableTitle, string columnsCsv, string rowJson)
+    {
+        var columns = ParseColumns(columnsCsv);
+        var row = ParseRow(rowJson);
+        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
+
+        if (!File.Exists(outputPath))
+        {
+            return WriteMarkdownTableRows(outputPath, tableTitle, columns, new[] { row });
+        }
+
+        var table = LocateMarkdownTable(outputPath, tableTitle);
+        if (table == null)
+        {
+            return WriteAdditionalTable(outputPath, tableTitle, columns, row);
+        }
+
+        if (table.Value.Headers.Count != columns.Count)
+        {
+            throw new InvalidOperationException($"Column count mismatch. Target table has {table.Value.Headers.Count} columns.");
+        }
+
+        var lines = File.ReadAllLines(outputPath).ToList();
+        var insertIndex = table.Value.DataRowLineIndices.Any()
+            ? table.Value.DataRowLineIndices.Last() + 1
+            : table.Value.AfterTableLineIndex;
+
+        lines.Insert(insertIndex, BuildMarkdownTableRow(columns, row));
+        File.WriteAllLines(outputPath, lines, new UTF8Encoding(false));
+
+        return 1;
+    }
+
+    private static long RewriteMarkdownRow(string destinationPath, string tableTitle, string columnsCsv, long rowIndex, string rowJson)
+    {
+        if (rowIndex < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(rowIndex), "rowIndex must be greater than 0.");
+        }
+
+        var columns = ParseColumns(columnsCsv);
+        var row = ParseRow(rowJson);
+        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
+
+        var table = LocateMarkdownTable(outputPath, tableTitle);
+        if (table == null)
+        {
+            throw new FileNotFoundException($"Could not find matching markdown table '{tableTitle}' in '{outputPath}'.");
+        }
+
+        if (table.Value.Headers.Count != columns.Count)
+        {
+            throw new InvalidOperationException($"Column count mismatch. Target table has {table.Value.Headers.Count} columns.");
+        }
+
+        var targetIndex = (int)rowIndex - 1;
+        if (targetIndex >= table.Value.DataRowLineIndices.Count)
+        {
+            throw new InvalidOperationException($"Row index {rowIndex} is out of range.");
+        }
+
+        var lines = File.ReadAllLines(outputPath).ToList();
+        var lineIndex = table.Value.DataRowLineIndices[targetIndex];
+        lines[lineIndex] = BuildMarkdownTableRow(columns, row);
+        File.WriteAllLines(outputPath, lines, new UTF8Encoding(false));
+
+        return 1;
+    }
+
+    private static long WriteMarkdownTableRows(string outputPath, string tableTitle, IReadOnlyList<string> columns, IEnumerable<IReadOnlyList<string?>> rows)
+    {
+        EnsureOutputDirectory(outputPath);
+        File.WriteAllText(outputPath, BuildMarkdownTableContent(tableTitle, columns, rows), new UTF8Encoding(false));
+        return 1;
+    }
+
+    private static long WriteAdditionalTable(string outputPath, string tableTitle, IReadOnlyList<string> columns, IReadOnlyList<string?> row)
+    {
+        EnsureOutputDirectory(outputPath);
+        var existingContent = File.ReadAllText(outputPath, new UTF8Encoding(false));
+        var separator = ResolveAppendSeparator(existingContent);
+        var tableContent = BuildMarkdownTableContent(tableTitle, columns, new[] { row });
+        File.AppendAllText(outputPath, $"{separator}{tableContent}", new UTF8Encoding(false));
+        return 1;
+    }
+
+    [SqliteFunction]
     public static long write_markdown(string destinationPath, string tableTitle, string columnsCsv, string rowsJson)
     {
         return WriteMarkdownDocument(destinationPath, tableTitle, columnsCsv, rowsJson, overwrite: false);
@@ -580,6 +678,176 @@ public static class MarkdownTableFunctions
         return values;
     }
 
+    private static MarkdownTableLocation? LocateMarkdownTable(string outputPath, string tableTitle)
+    {
+        if (!File.Exists(outputPath))
+        {
+            return null;
+        }
+
+        var tables = ParseMarkdownTablesWithLineNumbers(File.ReadAllLines(outputPath));
+        if (tables.Count == 0)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(tableTitle))
+        {
+            if (tables.Count != 1)
+            {
+                throw new InvalidOperationException("table_title is required when a file has multiple tables.");
+            }
+
+            return tables[0];
+        }
+
+        var target = tables.FirstOrDefault(table =>
+            string.Equals(table.Heading, tableTitle, StringComparison.OrdinalIgnoreCase));
+        if (target == null)
+        {
+            return null;
+        }
+
+        return target;
+    }
+
+    private static List<MarkdownTableLocation> ParseMarkdownTablesWithLineNumbers(string[] lines)
+    {
+        var tables = new List<MarkdownTableLocation>();
+        bool inCodeFence = false;
+        string? currentHeading = null;
+        int index = 0;
+
+        while (index < lines.Length)
+        {
+            var rawLine = lines[index];
+            if (IsCodeFence(rawLine))
+            {
+                inCodeFence = !inCodeFence;
+                index++;
+                continue;
+            }
+
+            if (inCodeFence)
+            {
+                index++;
+                continue;
+            }
+
+            if (TryParseHeading(rawLine, out var heading))
+            {
+                currentHeading = heading;
+                index++;
+                continue;
+            }
+
+            if (!TryParsePipeLine(rawLine, out var potentialHeader))
+            {
+                index++;
+                continue;
+            }
+
+            if (index + 1 >= lines.Length || !TryParsePipeSeparator(lines[index + 1], out _))
+            {
+                index++;
+                continue;
+            }
+
+            var parsedHeader = potentialHeader.Select(h => h?.Trim() ?? string.Empty).ToList();
+            var rowLineIndices = new List<int>();
+            int tableLine = index + 2;
+            while (tableLine < lines.Length)
+            {
+                if (!TryParsePipeLine(lines[tableLine], out var rowValues))
+                {
+                    break;
+                }
+
+                if (TryParsePipeSeparator(lines[tableLine], out _))
+                {
+                    tableLine++;
+                    continue;
+                }
+
+                if (rowValues.All(string.IsNullOrWhiteSpace))
+                {
+                    tableLine++;
+                    continue;
+                }
+
+                rowLineIndices.Add(tableLine);
+                tableLine++;
+            }
+
+            tables.Add(new MarkdownTableLocation(currentHeading?.Trim(), index, parsedHeader, rowLineIndices, tableLine));
+            currentHeading = null;
+            index = tableLine;
+        }
+
+        return tables;
+    }
+
+    private static string BuildMarkdownTableRow(IReadOnlyList<string> columns, IReadOnlyList<string?> row)
+    {
+        if (row.Count > columns.Count)
+        {
+            throw new InvalidOperationException($"Row has {row.Count} values, but table defines {columns.Count} columns.");
+        }
+
+        var result = new StringBuilder();
+        for (var i = 0; i < columns.Count; i++)
+        {
+            if (i > 0)
+            {
+                result.Append(" | ");
+            }
+
+            result.Append(EscapeMarkdownValue(i < row.Count ? row[i] : null));
+        }
+
+        return result.ToString();
+    }
+
+    private static string ResolveAppendSeparator(string existingContent)
+    {
+        if (string.IsNullOrWhiteSpace(existingContent))
+        {
+            return string.Empty;
+        }
+
+        if (existingContent.EndsWith("\r\n"))
+        {
+            return existingContent.EndsWith("\r\n\r\n") ? string.Empty : "\r\n";
+        }
+
+        if (existingContent.EndsWith("\n"))
+        {
+            return existingContent.EndsWith("\n\n") ? string.Empty : "\n";
+        }
+
+        return Environment.NewLine;
+    }
+
+    private static void EnsureOutputDirectory(string outputPath)
+    {
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+        }
+    }
+
+    private static IReadOnlyList<string?> ParseRow(string rowJson)
+    {
+        using var document = JsonDocument.Parse(rowJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new ArgumentException("rowJson must be a JSON array.");
+        }
+
+        return document.RootElement.EnumerateArray().Select(ToMarkdownCell).ToList();
+    }
+
     private static List<string> BuildTableColumns(IReadOnlyList<string> headers, IReadOnlyList<IReadOnlyList<string?>> rows, HashSet<string> usedColumns)
     {
         var columns = new List<string>();
@@ -696,6 +964,13 @@ public static class MarkdownTableFunctions
         Dictionary<string, string?> Values);
 
     private sealed record MarkdownTable(string? Title, IReadOnlyList<string> Headers, IReadOnlyList<IReadOnlyList<string?>> Rows);
+
+    private sealed record MarkdownTableLocation(
+        string? Heading,
+        int HeaderLineIndex,
+        IReadOnlyList<string> Headers,
+        IReadOnlyList<int> DataRowLineIndices,
+        int AfterTableLineIndex);
 
     private enum ColumnType
     {
