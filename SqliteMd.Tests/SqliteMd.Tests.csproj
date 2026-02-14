@@ -48,8 +48,13 @@
     <ProjectReference Include="..\\SqliteMd\\SqliteMd.csproj" />
   </ItemGroup>
 
-	<Target Name="PostBuild" AfterTargets="PostBuildEvent">
-		<Exec Condition=" '$(OS)' == 'Windows_NT' " Command="if exist $(MSBuildProjectDirectory)\..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll xcopy /y $(MSBuildProjectDirectory)\..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll $(TargetDir)" />
-	</Target>
+  <PropertyGroup>
+    <SqliteMdExtensionBinaryPath>..\artifacts\windows-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="Exists('..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll')">..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+  </PropertyGroup>
+
+  <Target Name="CopySqliteMdExtension" AfterTargets="Build">
+    <Copy SourceFiles="$(SqliteMdExtensionBinaryPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(SqliteMdExtensionBinaryPath)')" />
+  </Target>
 
 </Project>
