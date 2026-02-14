@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using SqliteDna.Integration;
 
 namespace SqliteMd;
@@ -173,6 +174,208 @@ public static class MarkdownTableFunctions
         }
 
         return new DynamicTable(schemaBuilder.ToString(), data);
+    }
+
+    [SqliteFunction]
+    public static long write_markdown(string destinationPath, string tableTitle, string columnsCsv, string rowsJson)
+    {
+        return WriteMarkdownDocument(destinationPath, tableTitle, columnsCsv, rowsJson, overwrite: false);
+    }
+
+    [SqliteFunction]
+    public static long write_markdown(string destinationPath, string tableTitle, string columnsCsv, string rowsJson, long overwrite)
+    {
+        return WriteMarkdownDocument(destinationPath, tableTitle, columnsCsv, rowsJson, overwrite != 0);
+    }
+
+    private static long WriteMarkdownDocument(string destinationPath, string tableTitle, string columnsCsv, string rowsJson, bool overwrite)
+    {
+        var columns = ParseColumns(columnsCsv);
+        var rows = ParseRows(rowsJson);
+        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
+        var content = BuildMarkdownTableContent(tableTitle, columns, rows);
+        var writeMode = overwrite ? FileMode.Create : FileMode.Append;
+
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+        }
+
+        using var stream = new FileStream(outputPath, writeMode, FileAccess.Write, FileShare.None);
+        using var writer = new StreamWriter(stream, Encoding.UTF8);
+
+        if (stream.Length > 0 && writeMode == FileMode.Append && !StartsWithNewLine(writer.BaseStream))
+        {
+            writer.WriteLine();
+            writer.Flush();
+        }
+
+        writer.Write(content);
+        return rows.Count;
+    }
+
+    private static string ResolveWriteTargetPath(string destinationPath, string tableTitle)
+    {
+        var expandedPath = Environment.ExpandEnvironmentVariables(destinationPath);
+        var fullPath = Path.GetFullPath(expandedPath);
+        var isDirectoryHint = Directory.Exists(fullPath)
+                             || fullPath.EndsWith(Path.DirectorySeparatorChar)
+                             || fullPath.EndsWith(Path.AltDirectorySeparatorChar);
+
+        if (isDirectoryHint)
+        {
+            var safeFileName = MakeSafeFileName(string.IsNullOrWhiteSpace(tableTitle) ? "table" : tableTitle);
+            return Path.Combine(fullPath, safeFileName);
+        }
+
+        if (string.IsNullOrWhiteSpace(Path.GetExtension(fullPath)))
+        {
+            return $"{fullPath}.md";
+        }
+
+        return fullPath;
+    }
+
+    private static string MakeSafeFileName(string sourceName)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var sanitized = new StringBuilder();
+        foreach (var ch in sourceName)
+        {
+            if (invalid.Contains(ch))
+                sanitized.Append('_');
+            else
+                sanitized.Append(ch);
+        }
+
+        var value = sanitized.ToString().Trim();
+        return string.IsNullOrWhiteSpace(value) ? "table.md" : $"{value}.md";
+    }
+
+    private static List<string> ParseColumns(string columnsCsv)
+    {
+        if (string.IsNullOrWhiteSpace(columnsCsv))
+        {
+            throw new ArgumentException("columnsCsv must contain at least one column.");
+        }
+
+        var columns = columnsCsv.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(c => string.IsNullOrWhiteSpace(c) ? "column" : c)
+            .ToList();
+
+        return columns.Count == 0 ? new List<string> { "column" } : columns;
+    }
+
+    private static List<IReadOnlyList<string?>> ParseRows(string? rowsJson)
+    {
+        if (string.IsNullOrWhiteSpace(rowsJson))
+            return new List<IReadOnlyList<string?>>();
+
+        using var document = JsonDocument.Parse(rowsJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new ArgumentException("rowsJson must be a JSON array.");
+        }
+
+        var rows = new List<IReadOnlyList<string?>>();
+        foreach (var row in document.RootElement.EnumerateArray())
+        {
+            if (row.ValueKind != JsonValueKind.Array)
+            {
+                throw new ArgumentException("Each row in rowsJson must be an array.");
+            }
+
+            rows.Add(row.EnumerateArray().Select(ToMarkdownCell).ToList());
+        }
+
+        return rows;
+    }
+
+    private static string? ToMarkdownCell(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Null or JsonValueKind.Undefined => null,
+            JsonValueKind.String => element.GetString(),
+            JsonValueKind.Number => element.GetRawText(),
+            JsonValueKind.True => "1",
+            JsonValueKind.False => "0",
+            _ => element.ToString()
+        };
+    }
+
+    private static string BuildMarkdownTableContent(string tableTitle, IReadOnlyList<string> columns, IReadOnlyList<IReadOnlyList<string?>> rows)
+    {
+        var content = new StringBuilder();
+
+        if (!string.IsNullOrWhiteSpace(tableTitle))
+        {
+            content.Append("# ").AppendLine(tableTitle.Trim());
+            content.AppendLine();
+        }
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            if (i > 0)
+                content.Append(" | ");
+            content.Append(EscapeMarkdownValue(columns[i]));
+        }
+        content.AppendLine();
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            if (i > 0)
+                content.Append(" | ");
+            content.Append("---");
+        }
+        content.AppendLine();
+
+        foreach (var row in rows)
+        {
+            for (var i = 0; i < columns.Count; i++)
+            {
+                if (i > 0)
+                    content.Append(" | ");
+
+                var value = i < row.Count ? row[i] : null;
+                content.Append(EscapeMarkdownValue(value));
+            }
+            content.AppendLine();
+        }
+
+        return content.ToString();
+    }
+
+    private static string EscapeMarkdownValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        return value
+            .Replace("|", "\\|")
+            .Replace("\r", " ")
+            .Replace("\n", " ");
+    }
+
+    private static bool StartsWithNewLine(Stream stream)
+    {
+        if (stream.Position == 0)
+            return false;
+
+        if (!stream.CanSeek)
+            return false;
+
+        var originalPosition = stream.Position;
+        stream.Seek(-1, SeekOrigin.End);
+        try
+        {
+            return stream.ReadByte() == '\n';
+        }
+        finally
+        {
+            stream.Seek(originalPosition, SeekOrigin.Begin);
+        }
     }
 
     private static IEnumerable<string> ResolveSourceFiles(string source, string searchPattern, long recursive)
