@@ -153,7 +153,7 @@ public static class MarkdownTableFunctions
             values[0] = row.SourcePath;
             values[1] = row.SourceFileName;
             values[2] = row.SourceTableIndex;
-            values[3] = row.SourceTableTitle;
+            values[3] = row.SourceTableTitle ?? (object)DBNull.Value;
             values[4] = row.SourceRow;
 
             for (int i = 5; i < columnOrder.Count; i++)
