@@ -49,7 +49,8 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <SqliteMdExtensionBinaryPath>..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath>..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\native\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)')">..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
     <SqliteMdExtensionBinaryPath Condition="Exists('..\artifacts\windows-x64\SqliteMd.dll')">..\artifacts\windows-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
     <SqliteMdExtensionBinaryPath Condition="Exists('..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll')">..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll</SqliteMdExtensionBinaryPath>
   </PropertyGroup>
