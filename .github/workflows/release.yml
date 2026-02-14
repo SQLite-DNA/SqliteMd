@@ -23,7 +23,7 @@ jobs:
       - name: Publish extension binary
         run: dotnet publish SqliteMd/SqliteMd.csproj --configuration Release --framework net7.0 --runtime win-x64 --self-contained false --output artifacts/windows-x64
       - name: Run tests
-        run: dotnet test SqliteMd.Tests/SqliteMd.Tests.csproj --configuration Release --no-build
+        run: dotnet test SqliteMd.Tests/SqliteMd.Tests.csproj --configuration Release --no-restore
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -33,4 +33,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/windows-x64/*
-
