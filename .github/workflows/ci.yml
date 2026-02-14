@@ -20,5 +20,7 @@ jobs:
         run: dotnet restore
       - name: Build
         run: dotnet build SqliteMd/SqliteMd.csproj -c Release --no-restore
+      - name: Publish extension binary
+        run: dotnet publish SqliteMd/SqliteMd.csproj --configuration Release --framework net7.0 --runtime win-x64 --self-contained false --output artifacts/windows-x64
       - name: Test
         run: dotnet test SqliteMd.Tests/SqliteMd.Tests.csproj -c Release --no-restore
