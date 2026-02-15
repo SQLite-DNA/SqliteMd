@@ -4,316 +4,510 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.Json;
 using SqliteDna.Integration;
 
 namespace SqliteMd;
 
 public static class MarkdownTableFunctions
 {
-    private const string DefaultPattern = "*.md";
-
-    [SqliteTableFunction]
-    public static DynamicTable markdown(string source, string searchPattern, long recursive)
+    // Writable, single-table view over a markdown pipe table.
+    //
+    // CREATE VIRTUAL TABLE t USING markdown_table('path.md', 'Title', 'id INTEGER, title TEXT', 'id');
+    // INSERT/UPDATE/DELETE then go through xUpdate and mutate the backing .md file.
+    [SqliteVirtualTable]
+    public static ISqliteVirtualTable markdown_table(string path, string tableTitle, string schema, string keyColumn)
     {
-        var sourceFiles = ResolveSourceFiles(source, searchPattern, recursive).ToList();
-        if (sourceFiles.Count == 0)
+        return new MarkdownFileTable(path, tableTitle, schema, keyColumn);
+    }
+
+    private sealed class MarkdownFileTable : ISqliteWritableVirtualTable, ISqliteVirtualTableTransaction, IDisposable
+    {
+        private readonly string filePath;
+        private readonly string tableTitle;
+        private readonly IReadOnlyList<SchemaColumn> columns;
+        private readonly int keyIndex;
+
+        private FileStream? lockedStream;
+        private string[]? baseLines;
+        private TableLocation? baseLocation;
+        private List<Row>? workingRows;
+        private bool dirty;
+
+        public MarkdownFileTable(string inputPath, string tableTitle, string schema, string keyColumn)
         {
-            throw new FileNotFoundException($"No markdown source found for '{source}'.");
+            filePath = ResolveTargetPath(inputPath, tableTitle);
+            this.tableTitle = tableTitle ?? string.Empty;
+            columns = ParseSchema(schema);
+            if (columns.Count == 0)
+                throw new ArgumentException("schema must contain at least one column.", nameof(schema));
+
+            keyIndex = columns.FindIndex(c => string.Equals(c.Name, keyColumn, StringComparison.OrdinalIgnoreCase));
+            if (keyIndex < 0)
+                throw new ArgumentException($"keyColumn '{keyColumn}' must match a column in schema.", nameof(keyColumn));
+
+            if (columns[keyIndex].Affinity != TypeAffinity.Integer)
+                throw new ArgumentException("keyColumn must be declared as INTEGER in schema.", nameof(keyColumn));
         }
 
-        var rows = new List<ParsedRow>();
-        var columnOrder = new List<string>
+        public string Schema => string.Join(", ", columns.Select(c => $"\"{c.Name}\" {c.SqlType}"));
+
+        public ISqliteVirtualTableCursor OpenCursor()
         {
-            "source_path",
-            "source_file_name",
-            "source_table_index",
-            "source_table_title",
-            "source_row"
-        };
+            // If there's an active transaction, expose the staged view.
+            var snapshot = workingRows != null ? workingRows.ToList() : LoadRowsFromDisk();
+            return new MarkdownFileCursor(columns, snapshot);
+        }
 
-        var usedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        public void Begin()
         {
-            "source_path",
-            "source_file_name",
-            "source_table_index",
-            "source_table_title",
-            "source_row"
-        };
+            if (lockedStream != null)
+                return;
 
-        var columnTypes = new Dictionary<string, ColumnType>(StringComparer.OrdinalIgnoreCase);
+            EnsureOutputDirectory(filePath);
+            lockedStream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            (baseLines, baseLocation, workingRows) = LoadTableFromStream(lockedStream, tableTitle, columns, keyIndex);
+            dirty = false;
+        }
 
-        foreach (var sourceFile in sourceFiles)
+        public void Commit()
         {
-            var fullPath = Path.GetFullPath(sourceFile);
-            var fileName = Path.GetFileName(fullPath);
-            var tables = ParseMarkdownTables(fullPath).ToList();
-            var tableIndex = 0;
+            if (lockedStream == null)
+                return;
 
-            foreach (var table in tables)
+            try
             {
-                tableIndex++;
-                var tableColumns = BuildTableColumns(table.Headers, table.Rows, usedColumns);
-
-                foreach (var column in tableColumns)
+                if (dirty)
                 {
-                    if (!columnOrder.Contains(column, StringComparer.OrdinalIgnoreCase))
+                    var lines = baseLines ?? Array.Empty<string>();
+                    var location = baseLocation;
+                    var rows = workingRows ?? new List<Row>();
+
+                    var newLines = RewriteDocument(lines, location, tableTitle, columns, rows);
+                    lockedStream.Position = 0;
+                    lockedStream.SetLength(0);
+                    using var writer = new StreamWriter(lockedStream, new UTF8Encoding(false), 4096, leaveOpen: true);
+                    for (int i = 0; i < newLines.Count; i++)
                     {
-                        columnOrder.Add(column);
+                        writer.WriteLine(newLines[i]);
                     }
+                    writer.Flush();
                 }
-
-                foreach (var rowWithIndex in table.Rows.Select((row, index) => (row, index)))
-                {
-                    var rowValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-
-                    for (int i = 0; i < tableColumns.Count; i++)
-                    {
-                        var key = tableColumns[i];
-                        var rawValue = i < rowWithIndex.row.Count ? rowWithIndex.row[i] : null;
-                        rowValues[key] = rawValue;
-
-                        if (!columnTypes.TryGetValue(key, out var existingType))
-                        {
-                            existingType = ColumnType.Unknown;
-                        }
-
-                        columnTypes[key] = MergeType(existingType, rawValue);
-                    }
-
-                    if (rowWithIndex.row.Count > tableColumns.Count)
-                    {
-                        for (int i = tableColumns.Count; i < rowWithIndex.row.Count; i++)
-                        {
-                            var overflowColumn = GetUniqueColumnName($"column_{i + 1}", usedColumns);
-                            if (!columnOrder.Contains(overflowColumn, StringComparer.OrdinalIgnoreCase))
-                            {
-                                columnOrder.Add(overflowColumn);
-                                tableColumns.Add(overflowColumn);
-                            }
-
-                            rowValues[overflowColumn] = rowWithIndex.row[i];
-                            if (!columnTypes.TryGetValue(overflowColumn, out var existingType))
-                            {
-                                existingType = ColumnType.Unknown;
-                            }
-
-                            columnTypes[overflowColumn] = MergeType(existingType, rowWithIndex.row[i]);
-                        }
-                    }
-
-                    rows.Add(new ParsedRow(
-                        fullPath,
-                        fileName,
-                        tableIndex,
-                        table.Title,
-                        rowWithIndex.index + 1,
-                        rowValues));
-                }
+            }
+            finally
+            {
+                lockedStream.Dispose();
+                lockedStream = null;
+                baseLines = null;
+                baseLocation = null;
+                workingRows = null;
+                dirty = false;
             }
         }
 
-        if (rows.Count == 0)
+        public void Rollback()
         {
-            throw new InvalidOperationException($"No markdown tables found in '{source}'.");
+            if (lockedStream == null)
+                return;
+
+            lockedStream.Dispose();
+            lockedStream = null;
+            baseLines = null;
+            baseLocation = null;
+            workingRows = null;
+            dirty = false;
         }
 
-        var schemaBuilder = new StringBuilder();
-        schemaBuilder.Append("\"source_path\" TEXT, ");
-        schemaBuilder.Append("\"source_file_name\" TEXT, ");
-        schemaBuilder.Append("\"source_table_index\" INTEGER, ");
-        schemaBuilder.Append("\"source_table_title\" TEXT, ");
-        schemaBuilder.Append("\"source_row\" INTEGER");
-
-        var dynamicColumns = columnOrder
-            .Where(c => c != "source_path"
-                        && c != "source_file_name"
-                        && c != "source_table_index"
-                        && c != "source_table_title"
-                        && c != "source_row")
-            .Distinct(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var column in dynamicColumns)
+        public void Dispose()
         {
-            var sqlType = columnTypes.TryGetValue(column, out var type)
-                ? type switch
+            Rollback();
+        }
+
+        public SqliteVirtualTableUpdateResult Update(SqliteVirtualTableUpdate update)
+        {
+            // Ensure an implicit transaction around a single xUpdate call.
+            if (lockedStream == null)
+            {
+                Begin();
+                try
                 {
-                    ColumnType.Integer => "INTEGER",
-                    ColumnType.Real => "REAL",
-                    _ => "TEXT"
+                    var result = ApplyUpdate(update);
+                    Commit();
+                    return result;
                 }
-                : "TEXT";
+                catch
+                {
+                    Rollback();
+                    throw;
+                }
+            }
 
-            schemaBuilder.Append(", \"").Append(column).Append("\" ").Append(sqlType);
+            return ApplyUpdate(update);
         }
 
-        var data = new List<object[]>();
+        private SqliteVirtualTableUpdateResult ApplyUpdate(SqliteVirtualTableUpdate update)
+        {
+            workingRows ??= new List<Row>();
+
+            switch (update.Kind)
+            {
+                case SqliteVirtualTableUpdateKind.Delete:
+                {
+                    if (update.OldRowId == null)
+                        throw new InvalidOperationException("DELETE requires old rowid.");
+
+                    var idx = workingRows.FindIndex(r => r.RowId == update.OldRowId.Value);
+                    if (idx >= 0)
+                    {
+                        workingRows.RemoveAt(idx);
+                        dirty = true;
+                    }
+
+                    return new SqliteVirtualTableUpdateResult(update.OldRowId.Value);
+                }
+
+                case SqliteVirtualTableUpdateKind.Insert:
+                {
+                    var cells = BuildCells(update.ColumnValues);
+                    var rowId = GetRowIdFromCells(cells, update.NewRowId);
+
+                    if (workingRows.Any(r => r.RowId == rowId))
+                        throw new InvalidOperationException("Rowid already exists.");
+
+                    workingRows.Add(new Row(rowId, cells));
+                    dirty = true;
+                    return new SqliteVirtualTableUpdateResult(rowId);
+                }
+
+                case SqliteVirtualTableUpdateKind.Update:
+                {
+                    if (update.OldRowId == null)
+                        throw new InvalidOperationException("UPDATE requires old rowid.");
+
+                    var idx = workingRows.FindIndex(r => r.RowId == update.OldRowId.Value);
+                    if (idx < 0)
+                        throw new InvalidOperationException("Row not found.");
+
+                    var cells = BuildCells(update.ColumnValues);
+                    var newRowId = GetRowIdFromCells(cells, update.NewRowId ?? update.OldRowId);
+
+                    if (newRowId != update.OldRowId.Value && workingRows.Any(r => r.RowId == newRowId))
+                        throw new InvalidOperationException("Rowid already exists.");
+
+                    workingRows[idx] = new Row(newRowId, cells);
+                    dirty = true;
+                    return new SqliteVirtualTableUpdateResult(newRowId);
+                }
+
+                default:
+                    throw new InvalidOperationException("Unknown update kind.");
+            }
+        }
+
+        private string?[] BuildCells(IReadOnlyList<SqliteValue> values)
+        {
+            if (values.Count != columns.Count)
+                throw new InvalidOperationException($"Expected {columns.Count} column values, got {values.Count}.");
+
+            var result = new string?[columns.Count];
+            for (int i = 0; i < columns.Count; i++)
+            {
+                result[i] = FormatCell(values[i], columns[i].Affinity);
+            }
+            return result;
+        }
+
+        private long GetRowIdFromCells(string?[] cells, long? explicitRowId)
+        {
+            var keyCell = cells[keyIndex];
+            long? keyValue = string.IsNullOrWhiteSpace(keyCell) ? null : long.Parse(keyCell!, NumberStyles.Integer, CultureInfo.InvariantCulture);
+            var rowId = explicitRowId ?? keyValue;
+            if (rowId == null)
+                throw new InvalidOperationException("Rowid (key column) must not be NULL.");
+
+            if (keyValue != null && keyValue.Value != rowId.Value)
+                throw new InvalidOperationException("rowid must match key column value.");
+
+            if (keyValue == null)
+                cells[keyIndex] = rowId.Value.ToString(CultureInfo.InvariantCulture);
+
+            return rowId.Value;
+        }
+
+        private List<Row> LoadRowsFromDisk()
+        {
+            if (!File.Exists(filePath))
+                return new List<Row>();
+
+            var lines = File.ReadAllLines(filePath);
+            var location = LocateMarkdownTable(lines, tableTitle);
+            if (location == null)
+                return new List<Row>();
+
+            if (location.Value.ColumnCount != columns.Count)
+                throw new InvalidOperationException("Column count mismatch between schema and markdown table.");
+
+            return ParseRows(lines, location.Value, columns, keyIndex);
+        }
+    }
+
+    private sealed class MarkdownFileCursor : ISqliteVirtualTableCursor
+    {
+        private readonly IReadOnlyList<SchemaColumn> columns;
+        private readonly IReadOnlyList<Row> rows;
+        private int index;
+
+        public MarkdownFileCursor(IReadOnlyList<SchemaColumn> columns, IReadOnlyList<Row> rows)
+        {
+            this.columns = columns;
+            this.rows = rows;
+            index = 0;
+        }
+
+        public void Dispose()
+        {
+        }
+
+        public void Filter(SqliteVirtualTableFilter filter)
+        {
+            index = 0;
+        }
+
+        public void Next()
+        {
+            index++;
+        }
+
+        public bool Eof => index >= rows.Count;
+
+        public long RowId => rows[index].RowId;
+
+        public object? GetColumnValue(int columnIndex)
+        {
+            var row = rows[index];
+            var raw = columnIndex < row.Cells.Length ? row.Cells[columnIndex] : null;
+            var affinity = columns[columnIndex].Affinity;
+
+            if (string.IsNullOrWhiteSpace(raw))
+                return null;
+
+            return affinity switch
+            {
+                TypeAffinity.Integer => long.Parse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture),
+                TypeAffinity.Real => double.Parse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture),
+                _ => raw
+            };
+        }
+    }
+
+    private static (string[] lines, TableLocation? location, List<Row> rows) LoadTableFromStream(
+        FileStream stream,
+        string tableTitle,
+        IReadOnlyList<SchemaColumn> columns,
+        int keyIndex)
+    {
+        stream.Position = 0;
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+        var content = reader.ReadToEnd();
+        var lines = SplitLines(content);
+
+        var location = LocateMarkdownTable(lines, tableTitle);
+        if (location == null)
+            return (lines, null, new List<Row>());
+
+        if (location.Value.ColumnCount != columns.Count)
+            throw new InvalidOperationException("Column count mismatch between schema and markdown table.");
+
+        var rows = ParseRows(lines, location.Value, columns, keyIndex);
+        return (lines, location, rows);
+    }
+
+    private static string[] SplitLines(string content)
+    {
+        return content
+            .Replace("\r\n", "\n")
+            .Replace("\r", "\n")
+            .Split('\n', StringSplitOptions.None);
+    }
+
+    private static List<string> RewriteDocument(string[] lines, TableLocation? location, string tableTitle, IReadOnlyList<SchemaColumn> schema, List<Row> rows)
+    {
+        var result = lines.ToList();
+        var newBlock = BuildMarkdownTableBlock(tableTitle, schema, rows);
+
+        if (location == null)
+        {
+            if (result.Count > 0 && !string.IsNullOrWhiteSpace(result.Last()))
+                result.Add(string.Empty);
+
+            result.AddRange(newBlock);
+            return result;
+        }
+
+        int start = location.Value.HeaderLineIndex;
+        int count = Math.Max(0, location.Value.AfterTableLineIndex - start);
+        result.RemoveRange(start, count);
+
+        // newBlock includes heading+blank line; keep existing heading, replace only the table.
+        var tableOnly = newBlock;
+        if (!string.IsNullOrWhiteSpace(tableTitle) && tableOnly.Count >= 2 && IsHeading(tableOnly[0]))
+            tableOnly = tableOnly.Skip(2).ToList();
+
+        result.InsertRange(start, tableOnly);
+        return result;
+    }
+
+    private static List<string> BuildMarkdownTableBlock(string tableTitle, IReadOnlyList<SchemaColumn> schema, List<Row> rows)
+    {
+        var result = new List<string>();
+        if (!string.IsNullOrWhiteSpace(tableTitle))
+        {
+            result.Add("# " + tableTitle.Trim());
+            result.Add(string.Empty);
+        }
+
+        result.Add(BuildHeaderLine(schema.Select(c => c.Name)));
+        result.Add(BuildSeparatorLine(schema.Count));
         foreach (var row in rows)
         {
-            var values = new object[columnOrder.Count];
-            values[0] = row.SourcePath;
-            values[1] = row.SourceFileName;
-            values[2] = row.SourceTableIndex;
-            values[3] = row.SourceTableTitle ?? (object)DBNull.Value;
-            values[4] = row.SourceRow;
+            result.Add(BuildRowLine(row.Cells));
+        }
+        return result;
+    }
 
-            for (int i = 5; i < columnOrder.Count; i++)
+    private static string BuildHeaderLine(IEnumerable<string> names)
+    {
+        return "| " + string.Join(" | ", names.Select(EscapeMarkdownValue)) + " |";
+    }
+
+    private static string BuildSeparatorLine(int columnCount)
+    {
+        return "| " + string.Join(" | ", Enumerable.Repeat("---", columnCount)) + " |";
+    }
+
+    private static string BuildRowLine(string?[] cells)
+    {
+        return "| " + string.Join(" | ", cells.Select(EscapeMarkdownValue)) + " |";
+    }
+
+    private static string EscapeMarkdownValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        return value
+            .Replace("|", "\\|")
+            .Replace("\r", " ")
+            .Replace("\n", " ");
+    }
+
+    private static string? FormatCell(SqliteValue value, TypeAffinity affinity)
+    {
+        if (value.IsNull)
+            return null;
+
+        return affinity switch
+        {
+            TypeAffinity.Integer => FormatInteger(value),
+            TypeAffinity.Real => FormatReal(value),
+            _ => value.GetString() ?? value.ToObject()?.ToString()
+        };
+    }
+
+    private static string FormatInteger(SqliteValue value)
+    {
+        return value.Kind switch
+        {
+            SqliteValueKind.Integer => value.GetInt64().ToString(CultureInfo.InvariantCulture),
+            SqliteValueKind.Float => ((long)value.GetDouble()).ToString(CultureInfo.InvariantCulture),
+            SqliteValueKind.Text => long.Parse(value.GetString() ?? "0", NumberStyles.Integer, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture),
+            _ => throw new InvalidOperationException("Invalid INTEGER value.")
+        };
+    }
+
+    private static string FormatReal(SqliteValue value)
+    {
+        return value.Kind switch
+        {
+            SqliteValueKind.Integer => ((double)value.GetInt64()).ToString(CultureInfo.InvariantCulture),
+            SqliteValueKind.Float => value.GetDouble().ToString(CultureInfo.InvariantCulture),
+            SqliteValueKind.Text => double.Parse(value.GetString() ?? "0", NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture),
+            _ => throw new InvalidOperationException("Invalid REAL value.")
+        };
+    }
+
+    private static IReadOnlyList<SchemaColumn> ParseSchema(string schema)
+    {
+        var parts = SplitCommaSeparated(schema);
+        var columns = new List<SchemaColumn>();
+
+        foreach (var part in parts)
+        {
+            var trimmed = part.Trim();
+            if (trimmed.Length == 0)
+                continue;
+
+            var tokens = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (tokens.Length == 0)
+                continue;
+
+            var name = Unquote(tokens[0]);
+            var type = tokens.Length >= 2 ? tokens[1] : "TEXT";
+            columns.Add(new SchemaColumn(name, type));
+        }
+
+        return columns;
+    }
+
+    private static List<string> SplitCommaSeparated(string value)
+    {
+        var result = new List<string>();
+        var current = new StringBuilder();
+        bool inQuotes = false;
+        char quote = '\0';
+
+        foreach (var ch in value)
+        {
+            if (inQuotes)
             {
-                var column = columnOrder[i];
-                if (row.Values.TryGetValue(column, out var rawValue))
-                {
-                    values[i] = ConvertCellValue(rawValue, columnTypes.GetValueOrDefault(column));
-                }
-                else
-                {
-                    values[i] = DBNull.Value;
-                }
+                current.Append(ch);
+                if (ch == quote)
+                    inQuotes = false;
+                continue;
             }
 
-            data.Add(values);
+            if (ch == '\'' || ch == '"')
+            {
+                inQuotes = true;
+                quote = ch;
+                current.Append(ch);
+                continue;
+            }
+
+            if (ch == ',')
+            {
+                result.Add(current.ToString());
+                current.Clear();
+                continue;
+            }
+
+            current.Append(ch);
         }
 
-        return new DynamicTable(schemaBuilder.ToString(), data);
+        result.Add(current.ToString());
+        return result;
     }
 
-    [SqliteFunction]
-    public static long insert_markdown_row(string destinationPath, string tableTitle, string columnsCsv, string rowJson)
+    private static string Unquote(string token)
     {
-        return InsertMarkdownRow(destinationPath, tableTitle, columnsCsv, rowJson);
+        if (token.Length >= 2)
+        {
+            if ((token.StartsWith("\"") && token.EndsWith("\"")) || (token.StartsWith("'") && token.EndsWith("'")))
+                return token.Substring(1, token.Length - 2);
+        }
+        return token;
     }
 
-    [SqliteFunction]
-    public static long rewrite_markdown_row(string destinationPath, string tableTitle, string columnsCsv, long rowIndex, string rowJson)
-    {
-        return RewriteMarkdownRow(destinationPath, tableTitle, columnsCsv, rowIndex, rowJson);
-    }
-
-    private static long InsertMarkdownRow(string destinationPath, string tableTitle, string columnsCsv, string rowJson)
-    {
-        var columns = ParseColumns(columnsCsv);
-        var row = ParseRow(rowJson);
-        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
-
-        if (!File.Exists(outputPath))
-        {
-            return WriteMarkdownTableRows(outputPath, tableTitle, columns, new[] { row });
-        }
-
-        var table = LocateMarkdownTable(outputPath, tableTitle);
-        if (table == null)
-        {
-            return WriteAdditionalTable(outputPath, tableTitle, columns, row);
-        }
-
-        if (table.Value.Headers.Count != columns.Count)
-        {
-            throw new InvalidOperationException($"Column count mismatch. Target table has {table.Value.Headers.Count} columns.");
-        }
-
-        var lines = File.ReadAllLines(outputPath).ToList();
-        var insertIndex = table.Value.DataRowLineIndices.Any()
-            ? table.Value.DataRowLineIndices.Last() + 1
-            : table.Value.AfterTableLineIndex;
-
-        lines.Insert(insertIndex, BuildMarkdownTableRow(columns, row));
-        File.WriteAllLines(outputPath, lines, new UTF8Encoding(false));
-
-        return 1;
-    }
-
-    private static long RewriteMarkdownRow(string destinationPath, string tableTitle, string columnsCsv, long rowIndex, string rowJson)
-    {
-        if (rowIndex < 1)
-        {
-            throw new ArgumentOutOfRangeException(nameof(rowIndex), "rowIndex must be greater than 0.");
-        }
-
-        var columns = ParseColumns(columnsCsv);
-        var row = ParseRow(rowJson);
-        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
-
-        var table = LocateMarkdownTable(outputPath, tableTitle);
-        if (table == null)
-        {
-            throw new FileNotFoundException($"Could not find matching markdown table '{tableTitle}' in '{outputPath}'.");
-        }
-
-        if (table.Value.Headers.Count != columns.Count)
-        {
-            throw new InvalidOperationException($"Column count mismatch. Target table has {table.Value.Headers.Count} columns.");
-        }
-
-        var targetIndex = (int)rowIndex - 1;
-        if (targetIndex >= table.Value.DataRowLineIndices.Count)
-        {
-            throw new InvalidOperationException($"Row index {rowIndex} is out of range.");
-        }
-
-        var lines = File.ReadAllLines(outputPath).ToList();
-        var lineIndex = table.Value.DataRowLineIndices[targetIndex];
-        lines[lineIndex] = BuildMarkdownTableRow(columns, row);
-        File.WriteAllLines(outputPath, lines, new UTF8Encoding(false));
-
-        return 1;
-    }
-
-    private static long WriteMarkdownTableRows(string outputPath, string tableTitle, IReadOnlyList<string> columns, IEnumerable<IReadOnlyList<string?>> rows)
-    {
-        EnsureOutputDirectory(outputPath);
-        File.WriteAllText(outputPath, BuildMarkdownTableContent(tableTitle, columns, rows), new UTF8Encoding(false));
-        return 1;
-    }
-
-    private static long WriteAdditionalTable(string outputPath, string tableTitle, IReadOnlyList<string> columns, IReadOnlyList<string?> row)
-    {
-        EnsureOutputDirectory(outputPath);
-        var existingContent = File.ReadAllText(outputPath, new UTF8Encoding(false));
-        var separator = ResolveAppendSeparator(existingContent);
-        var tableContent = BuildMarkdownTableContent(tableTitle, columns, new[] { row });
-        File.AppendAllText(outputPath, $"{separator}{tableContent}", new UTF8Encoding(false));
-        return 1;
-    }
-
-    [SqliteFunction]
-    public static long write_markdown(string destinationPath, string tableTitle, string columnsCsv, string rowsJson)
-    {
-        return WriteMarkdownDocument(destinationPath, tableTitle, columnsCsv, rowsJson, overwrite: false);
-    }
-
-    [SqliteFunction]
-    public static long write_markdown(string destinationPath, string tableTitle, string columnsCsv, string rowsJson, long overwrite)
-    {
-        return WriteMarkdownDocument(destinationPath, tableTitle, columnsCsv, rowsJson, overwrite != 0);
-    }
-
-    private static long WriteMarkdownDocument(string destinationPath, string tableTitle, string columnsCsv, string rowsJson, bool overwrite)
-    {
-        var columns = ParseColumns(columnsCsv);
-        var rows = ParseRows(rowsJson);
-        var outputPath = ResolveWriteTargetPath(destinationPath, tableTitle);
-        var content = BuildMarkdownTableContent(tableTitle, columns, rows);
-        var writeMode = overwrite ? FileMode.Create : FileMode.Append;
-
-        var outputDirectory = Path.GetDirectoryName(outputPath);
-        if (!string.IsNullOrEmpty(outputDirectory))
-        {
-            Directory.CreateDirectory(outputDirectory);
-        }
-
-        using var stream = new FileStream(outputPath, writeMode, FileAccess.Write, FileShare.None);
-        using var writer = new StreamWriter(stream, Encoding.UTF8);
-
-        if (stream.Length > 0 && writeMode == FileMode.Append && !StartsWithNewLine(writer.BaseStream))
-        {
-            writer.WriteLine();
-            writer.Flush();
-        }
-
-        writer.Write(content);
-        return rows.Count;
-    }
-
-    private static string ResolveWriteTargetPath(string destinationPath, string tableTitle)
+    private static string ResolveTargetPath(string destinationPath, string tableTitle)
     {
         var expandedPath = Environment.ExpandEnvironmentVariables(destinationPath);
         var fullPath = Path.GetFullPath(expandedPath);
@@ -328,9 +522,7 @@ public static class MarkdownTableFunctions
         }
 
         if (string.IsNullOrWhiteSpace(Path.GetExtension(fullPath)))
-        {
             return $"{fullPath}.md";
-        }
 
         return fullPath;
     }
@@ -341,163 +533,71 @@ public static class MarkdownTableFunctions
         var sanitized = new StringBuilder();
         foreach (var ch in sourceName)
         {
-            if (invalid.Contains(ch))
-                sanitized.Append('_');
-            else
-                sanitized.Append(ch);
+            sanitized.Append(invalid.Contains(ch) ? '_' : ch);
         }
 
         var value = sanitized.ToString().Trim();
         return string.IsNullOrWhiteSpace(value) ? "table.md" : $"{value}.md";
     }
 
-    private static List<string> ParseColumns(string columnsCsv)
+    private static void EnsureOutputDirectory(string outputPath)
     {
-        if (string.IsNullOrWhiteSpace(columnsCsv))
-        {
-            throw new ArgumentException("columnsCsv must contain at least one column.");
-        }
-
-        var columns = columnsCsv.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Select(c => string.IsNullOrWhiteSpace(c) ? "column" : c)
-            .ToList();
-
-        return columns.Count == 0 ? new List<string> { "column" } : columns;
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDirectory))
+            Directory.CreateDirectory(outputDirectory);
     }
 
-    private static List<IReadOnlyList<string?>> ParseRows(string? rowsJson)
+    private static List<Row> ParseRows(string[] lines, TableLocation location, IReadOnlyList<SchemaColumn> schema, int keyIndex)
     {
-        if (string.IsNullOrWhiteSpace(rowsJson))
-            return new List<IReadOnlyList<string?>>();
+        var rows = new List<Row>();
+        var columnCount = location.ColumnCount;
 
-        using var document = JsonDocument.Parse(rowsJson);
-        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        foreach (var rowLineIndex in location.DataRowLineIndices)
         {
-            throw new ArgumentException("rowsJson must be a JSON array.");
-        }
+            if (!TryParsePipeLine(lines[rowLineIndex], out var cells))
+                continue;
 
-        var rows = new List<IReadOnlyList<string?>>();
-        foreach (var row in document.RootElement.EnumerateArray())
-        {
-            if (row.ValueKind != JsonValueKind.Array)
+            var normalized = new string?[columnCount];
+            for (int i = 0; i < columnCount; i++)
             {
-                throw new ArgumentException("Each row in rowsJson must be an array.");
+                normalized[i] = i < cells.Count ? (cells[i] ?? string.Empty).Trim() : null;
             }
 
-            rows.Add(row.EnumerateArray().Select(ToMarkdownCell).ToList());
+            var keyCell = normalized[keyIndex];
+            if (string.IsNullOrWhiteSpace(keyCell))
+                throw new InvalidOperationException("Key column must not be NULL.");
+
+            var rowId = long.Parse(keyCell!, NumberStyles.Integer, CultureInfo.InvariantCulture);
+            rows.Add(new Row(rowId, normalized));
         }
 
         return rows;
     }
 
-    private static string? ToMarkdownCell(JsonElement element)
+    private static TableLocation? LocateMarkdownTable(string[] lines, string tableTitle)
     {
-        return element.ValueKind switch
+        var tables = ParseMarkdownTablesWithLineNumbers(lines);
+        if (tables.Count == 0)
+            return null;
+
+        if (string.IsNullOrWhiteSpace(tableTitle))
         {
-            JsonValueKind.Null or JsonValueKind.Undefined => null,
-            JsonValueKind.String => element.GetString(),
-            JsonValueKind.Number => element.GetRawText(),
-            JsonValueKind.True => "1",
-            JsonValueKind.False => "0",
-            _ => element.ToString()
-        };
+            if (tables.Count != 1)
+                throw new InvalidOperationException("tableTitle is required when a file has multiple tables.");
+            return tables[0];
+        }
+
+        var matches = tables.Where(t => string.Equals(t.Heading, tableTitle, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (matches.Count == 0)
+            return null;
+        if (matches.Count > 1)
+            throw new InvalidOperationException("Multiple matching tables found for title.");
+        return matches[0];
     }
 
-    private static string BuildMarkdownTableContent(string tableTitle, IReadOnlyList<string> columns, IReadOnlyList<IReadOnlyList<string?>> rows)
+    private static List<TableLocation> ParseMarkdownTablesWithLineNumbers(string[] lines)
     {
-        var content = new StringBuilder();
-
-        if (!string.IsNullOrWhiteSpace(tableTitle))
-        {
-            content.Append("# ").AppendLine(tableTitle.Trim());
-            content.AppendLine();
-        }
-
-        for (var i = 0; i < columns.Count; i++)
-        {
-            if (i > 0)
-                content.Append(" | ");
-            content.Append(EscapeMarkdownValue(columns[i]));
-        }
-        content.AppendLine();
-
-        for (var i = 0; i < columns.Count; i++)
-        {
-            if (i > 0)
-                content.Append(" | ");
-            content.Append("---");
-        }
-        content.AppendLine();
-
-        foreach (var row in rows)
-        {
-            for (var i = 0; i < columns.Count; i++)
-            {
-                if (i > 0)
-                    content.Append(" | ");
-
-                var value = i < row.Count ? row[i] : null;
-                content.Append(EscapeMarkdownValue(value));
-            }
-            content.AppendLine();
-        }
-
-        return content.ToString();
-    }
-
-    private static string EscapeMarkdownValue(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return string.Empty;
-
-        return value
-            .Replace("|", "\\|")
-            .Replace("\r", " ")
-            .Replace("\n", " ");
-    }
-
-    private static bool StartsWithNewLine(Stream stream)
-    {
-        if (stream.Position == 0)
-            return false;
-
-        if (!stream.CanSeek)
-            return false;
-
-        var originalPosition = stream.Position;
-        stream.Seek(-1, SeekOrigin.End);
-        try
-        {
-            return stream.ReadByte() == '\n';
-        }
-        finally
-        {
-            stream.Seek(originalPosition, SeekOrigin.Begin);
-        }
-    }
-
-    private static IEnumerable<string> ResolveSourceFiles(string source, string searchPattern, long recursive)
-    {
-        var path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(source));
-        var pattern = string.IsNullOrWhiteSpace(searchPattern) ? DefaultPattern : searchPattern;
-
-        if (File.Exists(path))
-        {
-            return new[] { path };
-        }
-
-        if (!Directory.Exists(path))
-        {
-            throw new FileNotFoundException($"Could not find file or directory '{source}'.");
-        }
-
-        var option = recursive != 0 ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        return Directory.EnumerateFiles(path, pattern, option).OrderBy(i => i, StringComparer.OrdinalIgnoreCase).ToList();
-    }
-
-    private static IEnumerable<MarkdownTable> ParseMarkdownTables(string filePath)
-    {
-        var lines = File.ReadAllLines(filePath);
+        var tables = new List<TableLocation>();
         bool inCodeFence = false;
         string? currentHeading = null;
         int index = 0;
@@ -525,48 +625,47 @@ public static class MarkdownTableFunctions
                 continue;
             }
 
-            if (!TryParsePipeLine(rawLine, out var potentialHeader))
+            if (!TryParsePipeLine(rawLine, out _))
             {
                 index++;
                 continue;
             }
 
-            if (index + 1 >= lines.Length || !TryParsePipeSeparator(lines[index + 1], out _))
+            if (index + 1 >= lines.Length || !TryParsePipeSeparator(lines[index + 1], out int cellCount))
             {
                 index++;
                 continue;
             }
 
-            var parsedHeader = potentialHeader.Select(h => h?.Trim() ?? string.Empty).ToList();
-            index += 2;
-            var parsedRows = new List<IReadOnlyList<string?>>();
-
-            while (index < lines.Length)
+            var rowLineIndices = new List<int>();
+            int tableLine = index + 2;
+            while (tableLine < lines.Length)
             {
-                if (!TryParsePipeLine(lines[index], out var rowValues))
-                {
+                if (!TryParsePipeLine(lines[tableLine], out var rowValues))
                     break;
-                }
 
-                if (TryParsePipeSeparator(lines[index], out int _))
+                if (TryParsePipeSeparator(lines[tableLine], out _))
                 {
-                    index++;
+                    tableLine++;
                     continue;
                 }
 
                 if (rowValues.All(string.IsNullOrWhiteSpace))
                 {
-                    index++;
+                    tableLine++;
                     continue;
                 }
 
-                parsedRows.Add(rowValues);
-                index++;
+                rowLineIndices.Add(tableLine);
+                tableLine++;
             }
 
-            yield return new MarkdownTable(currentHeading, parsedHeader, parsedRows);
+            tables.Add(new TableLocation(currentHeading?.Trim(), index, cellCount, rowLineIndices, tableLine));
             currentHeading = null;
+            index = tableLine;
         }
+
+        return tables;
     }
 
     private static bool TryParseHeading(string line, out string heading)
@@ -579,9 +678,7 @@ public static class MarkdownTableFunctions
 
         int hashes = 0;
         while (hashes < trimmed.Length && trimmed[hashes] == '#')
-        {
             hashes++;
-        }
 
         if (hashes == 0 || hashes > 6)
             return false;
@@ -593,12 +690,16 @@ public static class MarkdownTableFunctions
         return heading.Length > 0;
     }
 
+    private static bool IsHeading(string line)
+    {
+        return TryParseHeading(line, out _);
+    }
+
     private static bool TryParsePipeLine(string line, out IReadOnlyList<string?> values)
     {
         values = Array.Empty<string?>();
         if (string.IsNullOrWhiteSpace(line))
             return false;
-
         if (!line.Contains('|', StringComparison.Ordinal))
             return false;
 
@@ -678,305 +779,31 @@ public static class MarkdownTableFunctions
         return values;
     }
 
-    private static MarkdownTableLocation? LocateMarkdownTable(string outputPath, string tableTitle)
+    private readonly record struct SchemaColumn(string Name, string SqlType)
     {
-        if (!File.Exists(outputPath))
-        {
-            return null;
-        }
-
-        var tables = ParseMarkdownTablesWithLineNumbers(File.ReadAllLines(outputPath));
-        if (tables.Count == 0)
-        {
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(tableTitle))
-        {
-            if (tables.Count != 1)
-            {
-                throw new InvalidOperationException("table_title is required when a file has multiple tables.");
-            }
-
-            return tables[0];
-        }
-
-        var target = tables.FirstOrDefault(table =>
-            string.Equals(table.Heading, tableTitle, StringComparison.OrdinalIgnoreCase));
-        if (target == null)
-        {
-            return null;
-        }
-
-        return target;
+        public TypeAffinity Affinity => SqlType.StartsWith("INT", StringComparison.OrdinalIgnoreCase)
+            ? TypeAffinity.Integer
+            : SqlType.StartsWith("REAL", StringComparison.OrdinalIgnoreCase)
+              || SqlType.StartsWith("FLOA", StringComparison.OrdinalIgnoreCase)
+              || SqlType.StartsWith("DOUB", StringComparison.OrdinalIgnoreCase)
+                ? TypeAffinity.Real
+                : TypeAffinity.Text;
     }
 
-    private static List<MarkdownTableLocation> ParseMarkdownTablesWithLineNumbers(string[] lines)
+    private enum TypeAffinity
     {
-        var tables = new List<MarkdownTableLocation>();
-        bool inCodeFence = false;
-        string? currentHeading = null;
-        int index = 0;
-
-        while (index < lines.Length)
-        {
-            var rawLine = lines[index];
-            if (IsCodeFence(rawLine))
-            {
-                inCodeFence = !inCodeFence;
-                index++;
-                continue;
-            }
-
-            if (inCodeFence)
-            {
-                index++;
-                continue;
-            }
-
-            if (TryParseHeading(rawLine, out var heading))
-            {
-                currentHeading = heading;
-                index++;
-                continue;
-            }
-
-            if (!TryParsePipeLine(rawLine, out var potentialHeader))
-            {
-                index++;
-                continue;
-            }
-
-            if (index + 1 >= lines.Length || !TryParsePipeSeparator(lines[index + 1], out _))
-            {
-                index++;
-                continue;
-            }
-
-            var parsedHeader = potentialHeader.Select(h => h?.Trim() ?? string.Empty).ToList();
-            var rowLineIndices = new List<int>();
-            int tableLine = index + 2;
-            while (tableLine < lines.Length)
-            {
-                if (!TryParsePipeLine(lines[tableLine], out var rowValues))
-                {
-                    break;
-                }
-
-                if (TryParsePipeSeparator(lines[tableLine], out _))
-                {
-                    tableLine++;
-                    continue;
-                }
-
-                if (rowValues.All(string.IsNullOrWhiteSpace))
-                {
-                    tableLine++;
-                    continue;
-                }
-
-                rowLineIndices.Add(tableLine);
-                tableLine++;
-            }
-
-            tables.Add(new MarkdownTableLocation(currentHeading?.Trim(), index, parsedHeader, rowLineIndices, tableLine));
-            currentHeading = null;
-            index = tableLine;
-        }
-
-        return tables;
-    }
-
-    private static string BuildMarkdownTableRow(IReadOnlyList<string> columns, IReadOnlyList<string?> row)
-    {
-        if (row.Count > columns.Count)
-        {
-            throw new InvalidOperationException($"Row has {row.Count} values, but table defines {columns.Count} columns.");
-        }
-
-        var result = new StringBuilder();
-        for (var i = 0; i < columns.Count; i++)
-        {
-            if (i > 0)
-            {
-                result.Append(" | ");
-            }
-
-            result.Append(EscapeMarkdownValue(i < row.Count ? row[i] : null));
-        }
-
-        return result.ToString();
-    }
-
-    private static string ResolveAppendSeparator(string existingContent)
-    {
-        if (string.IsNullOrWhiteSpace(existingContent))
-        {
-            return string.Empty;
-        }
-
-        if (existingContent.EndsWith("\r\n"))
-        {
-            return existingContent.EndsWith("\r\n\r\n") ? string.Empty : "\r\n";
-        }
-
-        if (existingContent.EndsWith("\n"))
-        {
-            return existingContent.EndsWith("\n\n") ? string.Empty : "\n";
-        }
-
-        return Environment.NewLine;
-    }
-
-    private static void EnsureOutputDirectory(string outputPath)
-    {
-        var outputDirectory = Path.GetDirectoryName(outputPath);
-        if (!string.IsNullOrEmpty(outputDirectory))
-        {
-            Directory.CreateDirectory(outputDirectory);
-        }
-    }
-
-    private static IReadOnlyList<string?> ParseRow(string rowJson)
-    {
-        using var document = JsonDocument.Parse(rowJson);
-        if (document.RootElement.ValueKind != JsonValueKind.Array)
-        {
-            throw new ArgumentException("rowJson must be a JSON array.");
-        }
-
-        return document.RootElement.EnumerateArray().Select(ToMarkdownCell).ToList();
-    }
-
-    private static List<string> BuildTableColumns(IReadOnlyList<string> headers, IReadOnlyList<IReadOnlyList<string?>> rows, HashSet<string> usedColumns)
-    {
-        var columns = new List<string>();
-
-        for (int i = 0; i < headers.Count; i++)
-        {
-            var header = headers[i];
-            var rawName = string.IsNullOrWhiteSpace(header) ? $"column_{i + 1}" : SanitizeHeaderName(header);
-            columns.Add(GetUniqueColumnName(rawName, usedColumns));
-        }
-
-        int maxColumns = rows.Count == 0 ? headers.Count : rows.Max(r => r.Count);
-        for (int i = columns.Count; i < maxColumns; i++)
-        {
-            columns.Add(GetUniqueColumnName($"column_{i + 1}", usedColumns));
-        }
-
-        return columns;
-    }
-
-    private static string SanitizeHeaderName(string header)
-    {
-        var sanitized = new StringBuilder();
-        foreach (char ch in header)
-        {
-            if (char.IsLetterOrDigit(ch) || ch == '_')
-                sanitized.Append(ch);
-            else
-                sanitized.Append('_');
-        }
-
-        if (sanitized.Length == 0)
-            return "column";
-
-        return sanitized.ToString();
-    }
-
-    private static string GetUniqueColumnName(string name, HashSet<string> usedColumns)
-    {
-        var normalized = string.IsNullOrWhiteSpace(name) ? "column" : name;
-        if (char.IsDigit(normalized[0]))
-            normalized = "_" + normalized;
-
-        var unique = normalized;
-        int suffix = 2;
-        while (usedColumns.Contains(unique))
-        {
-            unique = $"{normalized}_{suffix}";
-            suffix++;
-        }
-
-        usedColumns.Add(unique);
-        return unique;
-    }
-
-    private static ColumnType MergeType(ColumnType current, string? rawValue)
-    {
-        if (string.IsNullOrWhiteSpace(rawValue))
-            return current;
-
-        if (current == ColumnType.Text)
-            return ColumnType.Text;
-
-        if (current == ColumnType.Real)
-            return IsLong(rawValue) || IsDouble(rawValue) ? ColumnType.Real : ColumnType.Text;
-
-        if (current == ColumnType.Integer)
-        {
-            return IsLong(rawValue)
-                ? ColumnType.Integer
-                : IsDouble(rawValue)
-                    ? ColumnType.Real
-                    : ColumnType.Text;
-        }
-
-        if (IsLong(rawValue))
-            return ColumnType.Integer;
-
-        if (IsDouble(rawValue))
-            return ColumnType.Real;
-
-        return ColumnType.Text;
-    }
-
-    private static bool IsLong(string value)
-    {
-        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
-    }
-
-    private static bool IsDouble(string value)
-    {
-        return double.TryParse(value, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out _);
-    }
-
-    private static object ConvertCellValue(string? rawValue, ColumnType type)
-    {
-        if (string.IsNullOrWhiteSpace(rawValue))
-            return DBNull.Value;
-
-        return type switch
-        {
-            ColumnType.Integer => long.Parse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture),
-            ColumnType.Real => double.Parse(rawValue, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture),
-            _ => rawValue!
-        };
-    }
-
-    private sealed record ParsedRow(
-        string SourcePath,
-        string SourceFileName,
-        int SourceTableIndex,
-        string? SourceTableTitle,
-        int SourceRow,
-        Dictionary<string, string?> Values);
-
-    private sealed record MarkdownTable(string? Title, IReadOnlyList<string> Headers, IReadOnlyList<IReadOnlyList<string?>> Rows);
-
-    private sealed record MarkdownTableLocation(
-        string? Heading,
-        int HeaderLineIndex,
-        IReadOnlyList<string> Headers,
-        IReadOnlyList<int> DataRowLineIndices,
-        int AfterTableLineIndex);
-
-    private enum ColumnType
-    {
-        Unknown,
         Integer,
         Real,
         Text
     }
+
+    private sealed record Row(long RowId, string?[] Cells);
+
+    private readonly record struct TableLocation(
+        string? Heading,
+        int HeaderLineIndex,
+        int ColumnCount,
+        IReadOnlyList<int> DataRowLineIndices,
+        int AfterTableLineIndex);
 }
+

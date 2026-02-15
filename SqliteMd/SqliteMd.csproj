@@ -10,7 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="SqliteDna" Version="*-*"/>
+    <ProjectReference Include="..\SQLite-DNA\SqliteDna\SqliteDna.Integration\SqliteDna.Integration.csproj" />
+    <ProjectReference Include="..\SQLite-DNA\SqliteDna\SqliteDna.SourceGenerator\SqliteDna.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

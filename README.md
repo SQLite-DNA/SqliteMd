@@ -1,21 +1,14 @@
 # SQLiteMd
 
-`SqliteMd` is a `SqliteDna` extension that exposes markdown-backed virtual tables and supports writing new `.md` tables.
+`SqliteMd` is a `SqliteDna` extension that treats a Markdown pipe table as a writable SQLite virtual table.
 
-## What it does
+The backing store is a `.md` file on disk. `INSERT`, `UPDATE`, and `DELETE` mutate the Markdown table through SQLite virtual-table `xUpdate`.
 
-- Read one Markdown file or all `.md` files in a folder.
-- Parse GitHub-style pipe tables.
-- Materialize row metadata (`source_path`, `source_file_name`, `source_table_index`, `source_table_title`, `source_row`).
-- Normalize duplicate headers.
-- Write new markdown-backed tables to new documents.
-- Supports folder scans with wildcard file pattern and optional recursion.
+## Quick start
 
-## Installation and quick start
-
-1. Download the latest release asset for your platform (`SqliteMd.dll`).
-2. Start `sqlite3` and load the extension with `.load`.
-3. Run SQL against markdown sources.
+1. Download the latest release asset (`SqliteMd.dll`).
+2. Load it in `sqlite3`.
+3. Create a virtual table backed by a Markdown file.
 
 Example session (Windows PowerShell + sqlite3):
 
@@ -25,128 +18,63 @@ PS> Invoke-WebRequest -Uri "https://github.com/SQLite-DNA/SqliteMd/releases/late
 PS> sqlite3 demo.db
 SQLite version 3.48.0 2025-01-09 12:00:00
 sqlite> .load .\SqliteMd.dll
-sqlite> .tables
-sqlite> CREATE VIRTUAL TABLE notes USING markdown('notes/notes-table.md', '', 0);
-sqlite> SELECT source_row, id, title, stars FROM notes ORDER BY source_row;
-1|1|Release notes|4
-2|2|Testing coverage|7
-```
-
-To bootstrap a new `.md` table file:
-
-```text
-sqlite> SELECT write_markdown('output/new-notes.md', 'Generated Notes', 'id,title,stars', '[["1","Plan",12],["2","Ship",24]]');
-2
-sqlite> .tables
-sqlite> CREATE VIRTUAL TABLE generated USING markdown('output/new-notes.md', '', 0);
-sqlite> SELECT source_row, id, title, stars FROM generated;
-1|1|Plan|12
-2|2|Ship|24
+sqlite> CREATE VIRTUAL TABLE notes
+   ...> USING markdown_table('notes.md', 'Notes', 'id INTEGER, title TEXT, stars INTEGER', 'id');
+sqlite> INSERT INTO notes(id, title, stars) VALUES (1, 'Release notes', 4);
+sqlite> INSERT INTO notes(id, title, stars) VALUES (2, 'Testing coverage', 7);
+sqlite> SELECT id, title, stars FROM notes ORDER BY id;
+1|Release notes|4
+2|Testing coverage|7
+sqlite> UPDATE notes SET stars = 10 WHERE id = 2;
+sqlite> DELETE FROM notes WHERE id = 1;
+sqlite> SELECT id, title, stars FROM notes ORDER BY id;
+2|Testing coverage|10
 ```
 
 ## API
 
-### Read API
-
 ```sql
-CREATE VIRTUAL TABLE v USING markdown(source, searchPattern, recursive);
-```
-
-- `source`: `.md` file path or folder path.
-- `searchPattern`: file pattern for folder scans (default `*.md`).
-- `recursive`: `0` for top-level only, `1` for recursive scan.
-
-### Write API
-
-```sql
-SELECT write_markdown(path, table_title, columns_csv, rows_json, overwrite);
+CREATE VIRTUAL TABLE t
+USING markdown_table(path, table_title, schema, key_column);
 ```
 
 - `path`
-  - Path to destination `.md` file.
-  - If a folder path is provided, the function writes `<table_title>.md` inside that folder.
+  - Markdown file path (with or without `.md` extension).
+  - If `path` is a directory, the extension writes `<table_title>.md` inside that directory.
 - `table_title`
-  - Markdown section title + generated table caption.
-- `columns_csv`
-  - Comma-separated header names.
-- `rows_json`
-  - JSON array of row arrays.
-  - Example: `[["1", "Plan", 12], ["2","Ship",24]]`
-- `overwrite`
-  - `0` (default): append to an existing document.
-  - `1`: replace existing file content.
+  - Markdown heading used to find the table (`# <table_title>`).
+  - Use `''` to target a file with exactly one table and no heading.
+- `schema`
+  - Column definitions (names + types) for the table.
+  - Example: `id INTEGER, title TEXT, stars INTEGER`
+- `key_column`
+  - Column name from `schema` used as the SQLite rowid mapping.
+  - Must be declared as `INTEGER` in `schema`.
 
-Returns the number of rows written.
+### Semantics
 
-```sql
-SELECT insert_markdown_row(path, table_title, columns_csv, row_json);
+- Reads parse the Markdown table from disk.
+- Writes stage changes using SQLite transaction callbacks and rewrite the table block in the Markdown document.
+- The key column is the stable row identity. `rowid` must match the key column value.
+
+## Development (local)
+
+This repo currently builds against a local checkout of `SQLite-DNA/SqliteDna` (for writable virtual-table support).
+
+Expected folder layout:
+
+```text
+C:\Work\
+  SqliteMd\
+  SQLite-DNA\
+    SqliteDna\
 ```
 
-Inserts a single row (`row_json`) into the matching markdown table. If no matching table is found, a new table is appended (or created).
-
-- `row_json`
-  - One JSON array representing a row.
-
-```sql
-SELECT rewrite_markdown_row(path, table_title, columns_csv, row_index, row_json);
-```
-
-Rewrites a row in place by `row_index` (`1` based) in the matching markdown table.
-- `row_index`: Data row index (1-based) within the selected table.
-- Returns `1` when exactly one row is rewritten.
-
-### SQL `INSERT` / `UPDATE` support
-
-`markdown(...)` is intentionally a read-only virtual table.
-Native SQL `INSERT` and `UPDATE` against that table are not supported.
-
-Why:
-
-- SQLite virtual tables can support writes only when the extension implements the virtual-table write interface (`xUpdate`).
-- `SqliteDna.Integration` table-function path used here (`SqliteTableFunction` + `DynamicTable`) emits a materialized read-only result set and does not expose `xUpdate`.
-- `INSERT`/`UPDATE` therefore fail at engine level for this virtual table implementation, independent of the underlying Markdown file format.
-- The extension intentionally keeps writes explicit with file-oriented helpers (`write_markdown`, `insert_markdown_row`, `rewrite_markdown_row`) to avoid ambiguous in-place SQL mutation semantics.
-
-Use `write_markdown(...)` as the write API:
-- default `overwrite = 0` appends a new table block,
-- `overwrite = 1` replaces the file content.
-
-This gives deterministic, atomic-like file writes and avoids implicit mutation semantics that are not well-defined for Markdown.
-
-## Examples
-
-### Read examples
-
-```sql
-CREATE VIRTUAL TABLE single USING markdown('notes/intro.md', '*.md', 0);
-CREATE VIRTUAL TABLE docs_top USING markdown('notes', '*.md', 0);
-CREATE VIRTUAL TABLE docs_all USING markdown('notes', '*.md', 1);
-```
-
-### Write examples
-
-```sql
--- create a new file in a folder
-SELECT write_markdown('output', 'Sprint Notes', 'id,title,stars', '[[1,"Plan",12],[2,"Ship",24]]');
-
--- create/overwrite a specific file
-SELECT write_markdown('output/sprint.md', 'Sprint Notes', 'id,title,stars', '[[1,"Plan",12],[2,"Ship",24]]', 1);
-
--- row-oriented helpers
-SELECT insert_markdown_row('output/sprint.md', 'Sprint Notes', 'id,title,stars', '[3,"Review",19]');
-SELECT rewrite_markdown_row('output/sprint.md', 'Sprint Notes', 'id,title,stars', 2, '[2,"Ship",28]');
-```
-
-## Development
+Commands:
 
 ```bash
 dotnet restore
-dotnet build SqliteMd.sln
-dotnet test SqliteMd.sln
+dotnet build SqliteMd/SqliteMd.csproj -c Release
+dotnet test SqliteMd.Tests/SqliteMd.Tests.csproj -c Release
 ```
 
-## Repository layout
-
-- `SqliteMd/`: extension implementation.
-- `SqliteMd.Tests/`: test project and fixtures.
-- `.github/workflows/`: CI and release automation.

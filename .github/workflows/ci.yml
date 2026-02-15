@@ -13,6 +13,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: SQLite-DNA/SqliteDna
+          ref: feature/writable-virtual-tables-xupdate
+          path: SQLite-DNA/SqliteDna
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 7.0.x
