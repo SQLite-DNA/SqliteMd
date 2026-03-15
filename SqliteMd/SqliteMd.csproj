@@ -4,14 +4,31 @@
     <TargetFramework>net7.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <PublishAOT>true</PublishAOT>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <SqliteDnaRoot Condition="Exists('..\..\SqliteDna\SqliteDna.Integration\SqliteDna.Integration.csproj')">..\..\SqliteDna</SqliteDnaRoot>
+    <SqliteDnaRoot Condition="'$(SqliteDnaRoot)' == '' and Exists('..\SQLite-DNA\SqliteDna\SqliteDna.Integration\SqliteDna.Integration.csproj')">..\SQLite-DNA\SqliteDna</SqliteDnaRoot>
+    <SqliteDnaRoot Condition="'$(SqliteDnaRoot)' == '' and Exists('..\..\SQLite-DNA\SqliteDna\SqliteDna.Integration\SqliteDna.Integration.csproj')">..\..\SQLite-DNA\SqliteDna</SqliteDnaRoot>
+  </PropertyGroup>
+
   <ItemGroup>
-    <ProjectReference Include="..\SQLite-DNA\SqliteDna\SqliteDna.Integration\SqliteDna.Integration.csproj" />
-    <ProjectReference Include="..\SQLite-DNA\SqliteDna\SqliteDna.SourceGenerator\SqliteDna.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="$(SqliteDnaRoot)\SqliteDna.Integration\SqliteDna.Integration.csproj" />
+    <ProjectReference Include="$(SqliteDnaRoot)\SqliteDna.SourceGenerator\SqliteDna.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <Import Project="$(SqliteDnaRoot)\Package\SqliteDna\build\SqliteDna.props" Condition="Exists('$(SqliteDnaRoot)\Package\SqliteDna\build\SqliteDna.props')" />
+
+  <Target Name="SetNoBuild">
+    <PropertyGroup>
+      <NoBuild>true</NoBuild>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="PublishAfterBuild" AfterTargets="AfterBuild" DependsOnTargets="SetNoBuild;Publish" />
 
 </Project>

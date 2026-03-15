@@ -61,16 +61,16 @@ public class MarkdownTableTests
             Assert.Equal(0, connection.ExecuteNonQuery(
                 $"CREATE VIRTUAL TABLE notes USING markdown_table('{escaped}', 'Notes', 'id INTEGER, title TEXT, stars INTEGER', 'id')"));
 
-            Assert.Equal(0, connection.ExecuteNonQuery("INSERT INTO notes(id, title, stars) VALUES (1, 'Alpha', 10)"));
-            Assert.Equal(0, connection.ExecuteNonQuery("INSERT INTO notes(id, title, stars) VALUES (2, 'Beta', 20)"));
+            Assert.Equal(1, connection.ExecuteNonQuery("INSERT INTO notes(id, title, stars) VALUES (1, 'Alpha', 10)"));
+            Assert.Equal(1, connection.ExecuteNonQuery("INSERT INTO notes(id, title, stars) VALUES (2, 'Beta', 20)"));
 
             Assert.True(File.Exists(path));
             Assert.Equal(2L, connection.ExecuteScalar<long>("SELECT COUNT(*) FROM notes"));
 
-            Assert.Equal(0, connection.ExecuteNonQuery("UPDATE notes SET stars = 99 WHERE id = 2"));
+            Assert.Equal(1, connection.ExecuteNonQuery("UPDATE notes SET stars = 99 WHERE id = 2"));
             Assert.Equal(99L, connection.ExecuteScalar<long>("SELECT stars FROM notes WHERE id = 2"));
 
-            Assert.Equal(0, connection.ExecuteNonQuery("DELETE FROM notes WHERE id = 1"));
+            Assert.Equal(1, connection.ExecuteNonQuery("DELETE FROM notes WHERE id = 1"));
             Assert.Equal(1L, connection.ExecuteScalar<long>("SELECT COUNT(*) FROM notes"));
         }
         finally
@@ -89,4 +89,3 @@ public class MarkdownTableTests
         return value.Replace("'", "''");
     }
 }
-

@@ -41,7 +41,7 @@ public static class MarkdownTableFunctions
             if (columns.Count == 0)
                 throw new ArgumentException("schema must contain at least one column.", nameof(schema));
 
-            keyIndex = columns.FindIndex(c => string.Equals(c.Name, keyColumn, StringComparison.OrdinalIgnoreCase));
+            keyIndex = FindColumnIndex(columns, keyColumn);
             if (keyIndex < 0)
                 throw new ArgumentException($"keyColumn '{keyColumn}' must match a column in schema.", nameof(keyColumn));
 
@@ -540,6 +540,17 @@ public static class MarkdownTableFunctions
         return string.IsNullOrWhiteSpace(value) ? "table.md" : $"{value}.md";
     }
 
+    private static int FindColumnIndex(IReadOnlyList<SchemaColumn> schemaColumns, string keyColumn)
+    {
+        for (int i = 0; i < schemaColumns.Count; i++)
+        {
+            if (string.Equals(schemaColumns[i].Name, keyColumn, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
     private static void EnsureOutputDirectory(string outputPath)
     {
         var outputDirectory = Path.GetDirectoryName(outputPath);
@@ -806,4 +817,3 @@ public static class MarkdownTableFunctions
         IReadOnlyList<int> DataRowLineIndices,
         int AfterTableLineIndex);
 }
-

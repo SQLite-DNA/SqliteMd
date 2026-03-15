@@ -10,8 +10,14 @@
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <SqliteDnaRoot Condition="Exists('..\..\SqliteDna\SqliteDna.Testing\SqliteDna.Testing.csproj')">..\..\SqliteDna</SqliteDnaRoot>
+    <SqliteDnaRoot Condition="'$(SqliteDnaRoot)' == '' and Exists('..\SQLite-DNA\SqliteDna\SqliteDna.Testing\SqliteDna.Testing.csproj')">..\SQLite-DNA\SqliteDna</SqliteDnaRoot>
+    <SqliteDnaRoot Condition="'$(SqliteDnaRoot)' == '' and Exists('..\..\SQLite-DNA\SqliteDna\SqliteDna.Testing\SqliteDna.Testing.csproj')">..\..\SQLite-DNA\SqliteDna</SqliteDnaRoot>
+  </PropertyGroup>
+
   <ItemGroup>
-    <ProjectReference Include="..\SQLite-DNA\SqliteDna\SqliteDna.Testing\SqliteDna.Testing.csproj" />
+    <ProjectReference Include="$(SqliteDnaRoot)\SqliteDna.Testing\SqliteDna.Testing.csproj" />
 
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.6.0" />
     <PackageReference Include="xunit" Version="2.4.2" />
@@ -49,14 +55,20 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <SqliteMdExtensionBinaryPath>..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\native\SqliteMd.dll</SqliteMdExtensionBinaryPath>
-    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)')">..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
-    <SqliteMdExtensionBinaryPath Condition="Exists('..\artifacts\windows-x64\SqliteMd.dll')">..\artifacts\windows-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
-    <SqliteMdExtensionBinaryPath Condition="Exists('..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll')">..\SqliteMd\bin\$(ConfigurationName)\net7.0\win-x64\publish\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath>..\SqliteMd\bin\$(Configuration)\net7.0\win-x64\publish\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)')">..\SqliteMd\bin\$(Configuration)\net7.0\win-x64\native\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)')">..\SqliteMd\bin\$(Configuration)\net7.0\win-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)') and Exists('..\artifacts\windows-x64\SqliteMd.dll')">..\artifacts\windows-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteDnaCppManagedPath>$(SqliteDnaRoot)\x64\$(Configuration)\SqliteDna.SQLiteCppManaged.dll</SqliteDnaCppManagedPath>
+    <SqliteDnaIjwHostPath>$(SqliteDnaRoot)\x64\$(Configuration)\Ijwhost.dll</SqliteDnaIjwHostPath>
+    <SqliteDnaNativeSqlitePath>$(SqliteDnaRoot)\SQLiteCpp\bin\$(Configuration)\sqlite3.dll</SqliteDnaNativeSqlitePath>
   </PropertyGroup>
 
   <Target Name="CopySqliteMdExtension" AfterTargets="Build">
     <Copy SourceFiles="$(SqliteMdExtensionBinaryPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(SqliteMdExtensionBinaryPath)')" />
+    <Copy SourceFiles="$(SqliteDnaCppManagedPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(SqliteDnaCppManagedPath)')" />
+    <Copy SourceFiles="$(SqliteDnaIjwHostPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(SqliteDnaIjwHostPath)')" />
+    <Copy SourceFiles="$(SqliteDnaNativeSqlitePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(SqliteDnaNativeSqlitePath)')" />
   </Target>
 
 </Project>
