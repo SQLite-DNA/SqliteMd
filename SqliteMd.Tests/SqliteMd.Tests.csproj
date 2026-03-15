@@ -38,6 +38,9 @@
     <None Update="Fixtures\single\dup-headers.md">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="Fixtures\single\preamble-notes.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Update="Fixtures\tree\root.md">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
