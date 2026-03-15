@@ -445,7 +445,7 @@ public class MarkdownTableTests
     }
 
     public static IEnumerable<object[]> ConnectionData =>
-        SqliteConnection.GenerateConnectionParameters(new string[] { "SqliteMd" }, SqliteProvider.SQLiteCpp);
+        SqliteConnection.GenerateConnectionParameters(new string[] { "SqliteMd" }, SqliteProvider.Microsoft);
 
     private static string SqliteLiteral(string value)
     {
