@@ -23,8 +23,13 @@ jobs:
           dotnet-version: 7.0.x
       - name: Restore
         run: dotnet restore SqliteMd.slnx
-      - name: Publish extension binary
-        run: dotnet publish SqliteMd/SqliteMd.csproj --configuration Release --framework net7.0 --runtime win-x64 --self-contained false --output artifacts/windows-x64
+      - name: Build extension binary
+        run: dotnet build SqliteMd/SqliteMd.csproj -c Release --no-restore
+      - name: Stage extension artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/windows-x64 -Force | Out-Null
+          Copy-Item SqliteMd/bin/Release/net7.0/win-x64/publish/* artifacts/windows-x64 -Recurse -Force
       - name: Publish CLI binary
         run: dotnet publish SqliteMd.Cli/SqliteMd.Cli.csproj --configuration Release --framework net7.0 --runtime win-x64 --self-contained false --output artifacts/sqlitemd-win-x64
       - name: Test extension
