@@ -1,4 +1,6 @@
 <Solution>
+  <Project Path="SqliteMd.Cli.Tests/SqliteMd.Cli.Tests.csproj" />
+  <Project Path="SqliteMd.Cli/SqliteMd.Cli.csproj" />
   <Project Path="SqliteMd.Tests/SqliteMd.Tests.csproj" />
   <Project Path="SqliteMd/SqliteMd.csproj" />
 </Solution>

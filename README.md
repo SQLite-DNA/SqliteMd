@@ -50,11 +50,16 @@ This is especially useful for:
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [CLI Quick Start](#cli-quick-start)
+- [Configuration File](#configuration-file)
+- [CLI Command Guide](#cli-command-guide)
 - [Mental Model](#mental-model)
 - [Function Overview](#function-overview)
 - [Single-File Tables](#single-file-tables)
 - [Repository Tables](#repository-tables)
 - [Diagnostics](#diagnostics)
+- [CLI vs Direct SQL](#cli-vs-direct-sql)
+- [Codex Skill](#codex-skill)
 - [Examples and Recipes](#examples-and-recipes)
 - [Limitations and Design Choices](#limitations-and-design-choices)
 - [Development](#development)
@@ -65,12 +70,23 @@ This is especially useful for:
 
 - Windows x64
 - `sqlite3.exe` or another SQLite host that supports loadable extensions
+- .NET 7 runtime if you want to run the standalone CLI outside the packaged zip
 
 The current published build targets `win-x64`.
 
-### Download the extension
+### Release assets
 
-Download the latest release asset:
+The release publishes both the SQLite extension and the companion CLI:
+
+- `SqliteMd.dll` and `SqliteMd.pdb` for direct SQLite usage
+- `sqlitemd.exe` as the standalone CLI entry point
+- `sqlitemd-win-x64.zip` containing `sqlitemd.exe` plus `SqliteMd.dll`
+- `sqlitemd.<version>.nupkg` as a local .NET tool package
+- `sqlitemd-agent-skill.zip` for Codex skill installation
+
+### Direct SQLite usage
+
+Download the extension asset:
 
 ```powershell
 Invoke-WebRequest `
@@ -93,6 +109,40 @@ That includes:
 - mode-aware virtual tables such as `markdown_table_mode(...)`
 - read-only repository scans such as `markdown_glob(...)`
 - diagnostics views such as `markdown_diagnostics(...)`
+
+### Standalone CLI usage
+
+The easiest way to try the CLI is the release zip. It already includes the extension beside the executable.
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github.com/SQLite-DNA/SqliteMd/releases/latest/download/sqlitemd-win-x64.zip" `
+  -OutFile sqlitemd-win-x64.zip
+
+Expand-Archive .\sqlitemd-win-x64.zip -DestinationPath .\sqlitemd
+.\sqlitemd\sqlitemd.exe --help
+```
+
+By default the CLI looks for `SqliteMd.dll` beside `sqlitemd.exe`. You can override that in `sqlitemd.json` with `extensionPath`.
+
+### Local .NET tool usage
+
+The `.nupkg` release asset is intended for local installation, not NuGet.org publishing.
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github.com/SQLite-DNA/SqliteMd/releases/latest/download/sqlitemd.0.0.0.nupkg" `
+  -OutFile .\sqlitemd.0.0.0.nupkg
+
+dotnet tool install `
+  --tool-path .\tools `
+  sqlitemd `
+  --add-source .
+
+.\tools\sqlitemd.exe --help
+```
+
+Replace `0.0.0` with the actual release version you downloaded.
 
 ## Quick Start
 
@@ -212,6 +262,286 @@ FROM diag
 WHERE accepted = 0
 ORDER BY path;
 ```
+
+## CLI Quick Start
+
+The `sqlitemd` CLI is the shortest path from Markdown to something usable in scripts, automation, or Codex.
+
+The CLI does three things for you:
+
+- locates and loads `SqliteMd.dll`
+- creates the same virtual tables you would create by hand in SQLite
+- gives you shortcuts for common tasks such as `show`, `append`, and `diagnose`
+
+### Start with the bundled examples
+
+This repository includes ready-to-run CLI examples under `examples/cli/`:
+
+- `examples/cli/sqlitemd.json`
+- `examples/cli/quick-start.ps1`
+- `examples/cli/repo-analysis.ps1`
+- `examples/cli/one-off-query.ps1`
+
+If you run from `examples/cli`, the sample config points to the existing Markdown fixtures in this repo.
+
+### Minimal CLI flow
+
+```powershell
+sqlitemd init
+sqlitemd targets list
+sqlitemd show notes
+sqlitemd append intake --set id=1 --set item="Ship docs refresh" --set owner=govert
+sqlitemd diagnose tasks --json
+```
+
+### One-off query without config
+
+```powershell
+sqlitemd query `
+  --kind table `
+  --path .\notes.md `
+  --title Notes `
+  --schema "id INTEGER, title TEXT, stars INTEGER" `
+  --key id `
+  --query "SELECT id, title FROM source ORDER BY id" `
+  --json
+```
+
+### Why the CLI exists when raw SQL already works
+
+The CLI is deliberately a thin companion, not a replacement for SQLite sessions.
+
+Use it when you want:
+
+- stable `--json` output for tools and agents
+- automatic extension loading
+- easy target aliases via `sqlitemd.json`
+- a consistent diagnostics workflow
+
+Stay with direct SQL when you want:
+
+- interactive exploration in `sqlite3`
+- joins across multiple attached targets
+- large or custom SQL scripts
+
+## Configuration File
+
+The normal CLI workflow is alias-based. Put a `sqlitemd.json` in your project root and refer to targets by name.
+
+`sqlitemd` discovers the file by walking upward from the current directory. Use `--config <path>` to override discovery.
+
+### Example
+
+```json
+{
+  "extensionPath": ".\\SqliteMd.dll",
+  "defaults": {
+    "output": "table"
+  },
+  "targets": {
+    "notes": {
+      "kind": "table",
+      "path": "notes.md",
+      "title": "Notes",
+      "schema": "id INTEGER, title TEXT, stars INTEGER",
+      "key": "id",
+      "writeMode": "read_write"
+    },
+    "intake": {
+      "kind": "table",
+      "path": "weekly-status.md",
+      "title": "Weekly Status",
+      "schema": "id INTEGER, item TEXT, owner TEXT",
+      "key": "id",
+      "writeMode": "append_only"
+    },
+    "tasks": {
+      "kind": "repo",
+      "glob": "docs\\**\\*.md",
+      "schema": "id INTEGER, title TEXT, owner TEXT, status TEXT"
+    }
+  }
+}
+```
+
+### Config rules
+
+- `extensionPath` is optional. If omitted, the CLI looks for `SqliteMd.dll` beside `sqlitemd.exe`.
+- `defaults.output` is optional and can be `table`, `json`, `csv`, or `tsv`.
+- `path`, `glob`, and `extensionPath` are resolved relative to the config file directory when they are not absolute.
+- `table` targets support `read_write`, `read_only`, and `append_only`.
+- `repo` targets are always read-only.
+
+## CLI Command Guide
+
+The CLI is intentionally small. It covers common workflows cleanly and leaves the advanced cases to SQL.
+
+### Global options
+
+- `--config <path>`: use a specific config file
+- `--json`: force JSON output
+- `--output table|json|csv|tsv`: choose human or machine-friendly output
+- `--echo-sql`: print generated `CREATE VIRTUAL TABLE` and query statements
+- `--verbose`: print extra runtime details such as extension loading
+- `--no-color`: reserved for plain-text terminals
+- `--help-all`: show the extended top-level guide
+
+### `sqlitemd init`
+
+Create a starter `sqlitemd.json` in the current directory.
+
+```powershell
+sqlitemd init
+```
+
+Use `--force` to overwrite an existing config.
+
+### `sqlitemd targets list`
+
+List configured aliases and the paths or globs they resolve to.
+
+```powershell
+sqlitemd targets list --json
+```
+
+### `sqlitemd show <target>`
+
+Attach a configured target and return all rows.
+
+```powershell
+sqlitemd show notes
+sqlitemd show tasks --json
+```
+
+For single-file targets, `show` orders by the configured key column. For repo targets, it orders by `_path` and `_table_index`.
+
+### `sqlitemd append <target> --set col=value`
+
+Insert a row into a configured single-file target.
+
+```powershell
+sqlitemd append notes --set id=3 --set title="Examples" --set stars=9
+sqlitemd append intake --set id=11 --set item="Ship docs refresh" --set owner=govert --json
+```
+
+Rules:
+
+- `append` only works for `table` targets
+- the configured key column must be supplied in `--set`
+- omitted non-key columns are inserted as `NULL`
+- `read_only` targets are rejected
+- `append_only` targets allow inserts but still reject updates and deletes
+
+### `sqlitemd diagnose <target>`
+
+Run the unified diagnostics view for a configured target.
+
+```powershell
+sqlitemd diagnose notes
+sqlitemd diagnose tasks --json
+```
+
+This is the first command to run when:
+
+- a file was skipped
+- a target returns no rows unexpectedly
+- a schema or key declaration seems wrong
+- a repo scan is missing files you expected to see
+
+`diagnose` exits with code `5` when any returned diagnostics row is rejected, which makes it suitable for scripts and agent workflows.
+
+### `sqlitemd sql <target> --query "..."`
+
+Attach a configured target and run raw SQL against it.
+
+```powershell
+sqlitemd sql notes --query "SELECT id, title FROM notes ORDER BY id"
+sqlitemd sql tasks --query "SELECT owner, COUNT(*) AS open_items FROM tasks WHERE status <> 'done' GROUP BY owner ORDER BY open_items DESC" --json
+```
+
+Use this when the CLI shortcut commands are too narrow but you still want config resolution and automatic extension loading.
+
+### `sqlitemd query --kind ... --query "..."`
+
+Run raw SQL against a one-off target without creating a config file.
+
+```powershell
+sqlitemd query `
+  --kind repo `
+  --glob .\docs\**\*.md `
+  --schema "id INTEGER, title TEXT, owner TEXT, status TEXT" `
+  --query "SELECT owner, COUNT(*) AS open_items FROM source WHERE status <> 'done' GROUP BY owner ORDER BY open_items DESC" `
+  --json
+```
+
+Use `--kind table` with `--path`, `--title`, `--schema`, `--key`, and optional `--write-mode`.
+
+### `sqlitemd help [topic]`
+
+Show the extended CLI help or a focused topic guide.
+
+```powershell
+sqlitemd help config
+sqlitemd help diagnostics
+sqlitemd help modes
+```
+
+### `sqlitemd completion pwsh|bash|zsh`
+
+Print a small shell completion script.
+
+```powershell
+sqlitemd completion pwsh
+```
+
+## CLI vs Direct SQL
+
+Both surfaces are first-class. The right choice depends on the shape of the task.
+
+### Prefer the CLI when
+
+- you want stable JSON output
+- you want configuration aliases
+- you are scripting or automating
+- you want `append` and `diagnose` as opinionated shortcuts
+- you want `--echo-sql` to understand what is being attached and queried
+
+### Prefer direct SQL when
+
+- you need joins across multiple attached targets
+- you want complex aggregates, CTEs, or ad hoc SQL exploration
+- you are already in `sqlite3`
+- you want to reason explicitly about the virtual table surface itself
+
+### A good practical rule
+
+- use `sqlitemd show`, `append`, and `diagnose` for routine work
+- use `sqlitemd sql` when you still want the CLI runtime but need custom SQL
+- drop to a normal SQLite session when you want the full language without shortcuts
+
+## Codex Skill
+
+The repo includes a Codex skill at `skills/sqlitemd-agent`.
+
+It is meant to make agent workflows predictable rather than magical:
+
+- prefer `sqlitemd --json`
+- resolve aliases from `sqlitemd.json`
+- run `diagnose` before guessing at acceptance problems
+- use `show` and `append` for routine operations
+- fall back to raw SQL only when the task is too complex for the CLI shortcuts
+
+### Installing the skill
+
+The release attaches `sqlitemd-agent-skill.zip`.
+
+Extract it into your Codex skills directory so the folder lands at:
+
+```text
+$CODEX_HOME/skills/sqlitemd-agent
+```
+
+The canonical source remains in this repo under `skills/sqlitemd-agent`.
 
 ## Mental Model
 
@@ -684,6 +1014,10 @@ The repository includes ready-to-run example assets under `examples/`:
 - `examples/single-file/append-only.sql`
 - `examples/repo/repository-scan.sql`
 - `examples/repo/repository-diagnostics.sql`
+- `examples/cli/sqlitemd.json`
+- `examples/cli/quick-start.ps1`
+- `examples/cli/repo-analysis.ps1`
+- `examples/cli/one-off-query.ps1`
 
 ### Query release notes stored in Markdown
 
@@ -805,6 +1139,23 @@ FROM diag
 ORDER BY path;
 ```
 
+### Use the bundled CLI config and scripts
+
+From `examples/cli/` you can exercise the CLI against the sample Markdown files in this repo:
+
+```powershell
+Set-Location .\examples\cli
+sqlitemd targets list
+sqlitemd show notes
+sqlitemd diagnose tasks --json
+```
+
+Or run the example scripts directly:
+
+- `examples/cli/quick-start.ps1`
+- `examples/cli/repo-analysis.ps1`
+- `examples/cli/one-off-query.ps1`
+
 ## Limitations and Design Choices
 
 SqliteMd is intentionally opinionated.
@@ -836,8 +1187,8 @@ C:\Work\
 ### Build
 
 ```powershell
-dotnet restore
-dotnet build SqliteMd\SqliteMd.csproj -c Debug
+dotnet restore SqliteMd.slnx
+dotnet build SqliteMd.slnx -c Debug
 ```
 
 ### Test
@@ -846,10 +1197,38 @@ dotnet build SqliteMd\SqliteMd.csproj -c Debug
 dotnet test SqliteMd.slnx
 ```
 
+### Publish the CLI locally
+
+```powershell
+dotnet publish SqliteMd.Cli\SqliteMd.Cli.csproj `
+  -c Release `
+  -f net7.0 `
+  -r win-x64 `
+  --self-contained false `
+  -o artifacts\sqlitemd-win-x64
+```
+
+### Pack the local .NET tool
+
+```powershell
+dotnet pack SqliteMd.Cli\SqliteMd.Cli.csproj `
+  -c Release `
+  -o artifacts\packages `
+  /p:Version=0.0.0-local `
+  /p:PackageVersion=0.0.0-local
+```
+
+### Validate the Codex skill
+
+```powershell
+python %USERPROFILE%\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\sqlitemd-agent
+```
+
 ### Notes for contributors
 
 - README examples assume Windows paths because the current project configuration targets `win-x64`.
 - The tests use the sibling `SqliteDna` checkout directly.
+- The CLI tests call the public `SqliteMdCliApp.RunAsync(...)` entry point and verify JSON/text contracts.
 - When changing acceptance rules, update diagnostics and tests together. Diagnostics are part of the product surface, not just development scaffolding.
 
 ## Summary
@@ -862,5 +1241,7 @@ Use:
 - `markdown_table_mode(...)` when you want the same single-file model but with `read_only` or `append_only` constraints
 - `markdown_glob(...)` / `markdown_repo(...)` when you want one queryable view over many Markdown files
 - `markdown_diagnostics(...)` when you want the extension to explain itself clearly
+- `sqlitemd` when you want the same capabilities through a friendlier CLI with stable JSON output
+- `skills/sqlitemd-agent` when you want Codex to use the tool predictably
 
 If your data wants to remain in text, but your workflow wants joins, filters, aggregation, and rigor, this is the tool.

@@ -1,0 +1,28 @@
+{
+  "defaults": {
+    "output": "table"
+  },
+  "targets": {
+    "notes": {
+      "kind": "table",
+      "path": "..\\single-file\\release-notes.md",
+      "title": "Release Notes",
+      "schema": "id INTEGER, title TEXT, stars INTEGER",
+      "key": "id",
+      "writeMode": "read_write"
+    },
+    "intake": {
+      "kind": "table",
+      "path": "..\\single-file\\append-target.md",
+      "title": "Weekly Status",
+      "schema": "id INTEGER, item TEXT, owner TEXT",
+      "key": "id",
+      "writeMode": "append_only"
+    },
+    "tasks": {
+      "kind": "repo",
+      "glob": "..\\repo\\docs\\**\\*.md",
+      "schema": "id INTEGER, title TEXT, owner TEXT, status TEXT"
+    }
+  }
+}

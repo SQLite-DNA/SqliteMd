@@ -1,0 +1,4 @@
+interface:
+  display_name: "SqliteMd Agent"
+  short_description: "Use sqlitemd for Markdown table workflows"
+  default_prompt: "Use $sqlitemd-agent to inspect, diagnose, or append Markdown-backed tables with sqlitemd."

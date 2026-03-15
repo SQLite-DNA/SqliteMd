@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sqlitemd</ToolCommandName>
+    <PackageId>sqlitemd</PackageId>
+    <Description>Companion CLI for SqliteMd Markdown-backed SQLite tables.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <SqliteMdRoot>..</SqliteMdRoot>
+    <SqliteMdExtensionBinaryPath>$(SqliteMdRoot)\SqliteMd\bin\$(Configuration)\net7.0\win-x64\publish\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+    <SqliteMdExtensionBinaryPath Condition="!Exists('$(SqliteMdExtensionBinaryPath)')">$(SqliteMdRoot)\artifacts\windows-x64\SqliteMd.dll</SqliteMdExtensionBinaryPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SqliteMd\SqliteMd.csproj" ReferenceOutputAssembly="false" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="7.0.3" />
+    <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(SqliteMdExtensionBinaryPath)')">
+    <None Include="$(SqliteMdExtensionBinaryPath)" Pack="true" PackagePath="tools\$(TargetFramework)\any\" Link="SqliteMd.dll" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" Link="README.md" />
+  </ItemGroup>
+
+  <Target Name="CopySqliteMdExtensionToBuildOutput" AfterTargets="Build">
+    <Copy SourceFiles="$(SqliteMdExtensionBinaryPath)"
+          DestinationFiles="$(TargetDir)SqliteMd.dll"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(SqliteMdExtensionBinaryPath)')" />
+  </Target>
+
+  <Target Name="CreateSqlitemdBuildAlias" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetDir)SqliteMd.Cli.exe"
+          DestinationFiles="$(TargetDir)sqlitemd.exe"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(TargetDir)SqliteMd.Cli.exe')" />
+  </Target>
+
+  <Target Name="CopySqliteMdExtensionToPublishOutput" AfterTargets="Publish">
+    <Copy SourceFiles="$(SqliteMdExtensionBinaryPath)"
+          DestinationFiles="$(PublishDir)SqliteMd.dll"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(SqliteMdExtensionBinaryPath)')" />
+  </Target>
+
+  <Target Name="CreateSqlitemdPublishAlias" AfterTargets="Publish">
+    <Copy SourceFiles="$(PublishDir)SqliteMd.Cli.exe"
+          DestinationFiles="$(PublishDir)sqlitemd.exe"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(PublishDir)SqliteMd.Cli.exe')" />
+  </Target>
+
+</Project>

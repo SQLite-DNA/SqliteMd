@@ -1,0 +1,21 @@
+{
+  "extensionPath": ".\\SqliteMd.dll",
+  "defaults": {
+    "output": "table"
+  },
+  "targets": {
+    "notes": {
+      "kind": "table",
+      "path": "notes.md",
+      "title": "Notes",
+      "schema": "id INTEGER, title TEXT, stars INTEGER",
+      "key": "id",
+      "writeMode": "append_only"
+    },
+    "tasks": {
+      "kind": "repo",
+      "glob": "docs/**/*.md",
+      "schema": "id INTEGER, title TEXT, owner TEXT, status TEXT"
+    }
+  }
+}
